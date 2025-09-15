@@ -1,0 +1,410 @@
+openapi: 3.0.0
+info:
+  title: MailHog API v2
+  version: 2.0.0
+  description: |
+    Enhanced RESTful API for MailHog with improved search and pagination.
+    This is the active development API with new features.
+
+servers:
+  - url: http://localhost:8025
+    description: Default local server
+
+security:
+  - basicAuth: []
+  - {}
+
+paths:
+  /api/v2/messages:
+    get:
+      summary: List messages with pagination
+      description: Retrieve a paginated list of messages
+      parameters:
+        - name: start
+          in: query
+          description: Start index (0-based)
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          description: Number of messages to return
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 50
+            minimum: 1
+            maximum: 250
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+        '400':
+          description: Invalid parameters
+
+  /api/v2/search:
+    get:
+      summary: Search messages
+      description: |
+        Search messages by various criteria.
+        - `from`: Search by sender email address
+        - `to`: Search by recipient email address
+        - `containing`: Full-text search in message content
+      parameters:
+        - name: kind
+          in: query
+          description: Type of search to perform
+          required: true
+          schema:
+            type: string
+            enum: [from, to, containing]
+        - name: query
+          in: query
+          description: Search term
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: start
+          in: query
+          description: Start index for pagination
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          description: Number of results to return
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 50
+            minimum: 1
+            maximum: 250
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+        '400':
+          description: Invalid search parameters
+
+  /api/v2/messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+    
+    get:
+      summary: Get message details
+      description: Retrieve full message details including content and MIME structure
+      responses:
+        '200':
+          description: Message details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageDetail'
+        '404':
+          description: Message not found
+    
+    delete:
+      summary: Delete message
+      description: Delete a specific message
+      responses:
+        '204':
+          description: Message deleted successfully
+        '404':
+          description: Message not found
+
+  /api/v2/messages/{id}/release:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+    
+    post:
+      summary: Release message
+      description: Forward message to real SMTP server with enhanced options
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseRequest'
+      responses:
+        '200':
+          description: Message released successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseResponse'
+        '404':
+          description: Message not found
+        '422':
+          description: Invalid release configuration
+        '502':
+          description: SMTP server error
+
+components:
+  schemas:
+    MessageList:
+      type: object
+      required:
+        - total
+        - start
+        - count
+        - messages
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: Total number of messages in storage
+        start:
+          type: integer
+          format: int64
+          description: Start index of returned messages
+        count:
+          type: integer
+          format: int64
+          description: Number of messages in this response
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/MessageSummary'
+    
+    MessageSummary:
+      type: object
+      required:
+        - id
+        - from
+        - to
+        - created
+        - size
+      properties:
+        id:
+          type: string
+          description: Unique message identifier
+        from:
+          $ref: '#/components/schemas/EmailPath'
+        to:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmailPath'
+        subject:
+          type: string
+          description: Email subject line
+        created:
+          type: string
+          format: date-time
+          description: Message receipt timestamp
+        size:
+          type: integer
+          format: int64
+          description: Message size in bytes
+        attachments:
+          type: integer
+          description: Number of attachments
+        preview:
+          type: string
+          description: First 200 characters of plain text content
+          maxLength: 200
+    
+    MessageDetail:
+      allOf:
+        - $ref: '#/components/schemas/MessageSummary'
+        - type: object
+          properties:
+            headers:
+              type: object
+              additionalProperties:
+                type: array
+                items:
+                  type: string
+              description: All message headers
+            content:
+              $ref: '#/components/schemas/MessageContent'
+            mime:
+              $ref: '#/components/schemas/MIMEStructure'
+            raw:
+              $ref: '#/components/schemas/RawMessage'
+    
+    EmailPath:
+      type: object
+      properties:
+        address:
+          type: string
+          format: email
+          description: Email address
+        name:
+          type: string
+          description: Display name
+        mailbox:
+          type: string
+          description: Mailbox part of address
+        domain:
+          type: string
+          description: Domain part of address
+        relays:
+          type: array
+          items:
+            type: string
+          description: SMTP relay chain
+        params:
+          type: string
+          description: SMTP parameters
+    
+    MessageContent:
+      type: object
+      properties:
+        headers:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        body:
+          type: string
+          description: Message body (plain text or HTML)
+        size:
+          type: integer
+          description: Content size in bytes
+    
+    MIMEStructure:
+      type: object
+      properties:
+        parts:
+          type: array
+          items:
+            type: object
+            properties:
+              headers:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    type: string
+              contentType:
+                type: string
+                description: MIME content type
+              transferEncoding:
+                type: string
+                description: Content transfer encoding
+              body:
+                type: string
+                description: Decoded body content
+              size:
+                type: integer
+                description: Part size in bytes
+              fileName:
+                type: string
+                description: Attachment filename if applicable
+              partIndex:
+                type: integer
+                description: Index for downloading this part
+    
+    RawMessage:
+      type: object
+      properties:
+        from:
+          type: string
+          description: Raw sender address
+        to:
+          type: array
+          items:
+            type: string
+          description: Raw recipient addresses
+        data:
+          type: string
+          description: Complete raw message data
+        helo:
+          type: string
+          description: HELO/EHLO hostname
+    
+    ReleaseRequest:
+      type: object
+      required:
+        - host
+        - port
+        - recipients
+      properties:
+        host:
+          type: string
+          description: SMTP server hostname
+          example: smtp.gmail.com
+        port:
+          type: integer
+          description: SMTP server port
+          example: 587
+          minimum: 1
+          maximum: 65535
+        recipients:
+          type: array
+          items:
+            type: string
+            format: email
+          description: Override recipients (uses original if empty)
+          minItems: 0
+        username:
+          type: string
+          description: SMTP authentication username
+        password:
+          type: string
+          description: SMTP authentication password
+        mechanism:
+          type: string
+          description: SMTP authentication mechanism
+          enum: [PLAIN, LOGIN, CRAM-MD5]
+        useTLS:
+          type: boolean
+          description: Use TLS/STARTTLS
+          default: false
+        insecureSkipVerify:
+          type: boolean
+          description: Skip TLS certificate verification
+          default: false
+    
+    ReleaseResponse:
+      type: object
+      properties:
+        released:
+          type: boolean
+          description: Whether release was successful
+        messageId:
+          type: string
+          description: Original message ID
+        recipients:
+          type: array
+          items:
+            type: string
+          description: Recipients the message was sent to
+        smtpResponse:
+          type: string
+          description: SMTP server response
+        error:
+          type: string
+          description: Error message if release failed
+
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Optional HTTP Basic Authentication

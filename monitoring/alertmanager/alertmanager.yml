@@ -1,0 +1,351 @@
+# =============================================================================
+# Pat Fortress - AlertManager Configuration
+# Intelligent Alert Routing and Notification Management
+# =============================================================================
+
+global:
+  # SMTP configuration for email notifications
+  smtp_smarthost: '${SMTP_HOST:-localhost:587}'
+  smtp_from: 'fortress-alerts@pat.local'
+  smtp_auth_username: '${SMTP_USERNAME:-fortress}'
+  smtp_auth_password: '${SMTP_PASSWORD:-fortress123}'
+  smtp_require_tls: true
+  
+  # Slack webhook configuration
+  slack_api_url: '${SLACK_API_URL}'
+  
+  # Global notification settings
+  resolve_timeout: 5m
+  http_config:
+    follow_redirects: true
+  
+# =============================================================================
+# Route Configuration - Intelligent Alert Routing
+# =============================================================================
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'default'
+  
+  routes:
+  
+  # =================================
+  # Critical Infrastructure Alerts
+  # =================================
+  - match:
+      severity: critical
+    receiver: 'critical-alerts'
+    group_wait: 5s
+    group_interval: 5s
+    repeat_interval: 15m
+    continue: true
+    
+  # Database critical issues
+  - match_re:
+      alertname: '(PostgreSQLDown|RedisDown|DatabaseReplicationFailure)'
+    receiver: 'database-team'
+    group_wait: 5s
+    repeat_interval: 10m
+    continue: true
+    
+  # Security incidents
+  - match:
+      category: security
+    receiver: 'security-team'
+    group_wait: 5s
+    repeat_interval: 5m
+    continue: true
+    
+  # =================================
+  # Application-Specific Routes
+  # =================================
+  
+  # Fortress core application alerts
+  - match:
+      service: fortress-core
+    receiver: 'core-team'
+    group_interval: 2m
+    repeat_interval: 30m
+    
+  # SMTP service alerts
+  - match_re:
+      service: '(fortress-smtp|email-processing)'
+    receiver: 'email-team'
+    group_interval: 2m
+    repeat_interval: 30m
+    
+  # Plugin runtime alerts
+  - match:
+      service: fortress-plugins
+    receiver: 'plugin-team'
+    group_interval: 5m
+    repeat_interval: 45m
+    
+  # API and GraphQL alerts
+  - match_re:
+      service: '(fortress-api|graphql-api)'
+    receiver: 'api-team'
+    group_interval: 2m
+    repeat_interval: 30m
+    
+  # =================================
+  # Business Logic Routes
+  # =================================
+  
+  # Business KPI alerts (low urgency but important)
+  - match:
+      category: business
+    receiver: 'business-team'
+    group_interval: 10m
+    repeat_interval: 2h
+    
+  # Performance degradation alerts
+  - match_re:
+      alertname: '(HighResponseTime|HighMemoryUsage|HighCPUUsage)'
+    receiver: 'performance-team'
+    group_interval: 5m
+    repeat_interval: 1h
+    
+  # =================================
+  # Infrastructure Routes
+  # =================================
+  
+  # Kubernetes alerts
+  - match:
+      category: kubernetes
+    receiver: 'infrastructure-team'
+    group_interval: 5m
+    repeat_interval: 1h
+    
+  # Network and connectivity alerts
+  - match_re:
+      alertname: '(NodeDown|NetworkLatencyHigh|ConnectivityIssues)'
+    receiver: 'network-team'
+    group_wait: 5s
+    repeat_interval: 15m
+
+# =============================================================================
+# Receivers - Notification Endpoints
+# =============================================================================
+
+receivers:
+
+# =================================
+# Default Receiver
+# =================================
+
+- name: 'default'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#fortress-alerts'
+    title: 'Fortress Alert - {{ .GroupLabels.alertname }}'
+    text: |
+      {{ range .Alerts }}
+      *Alert:* {{ .Annotations.summary }}
+      *Description:* {{ .Annotations.description }}
+      *Severity:* {{ .Labels.severity }}
+      *Service:* {{ .Labels.service }}
+      {{ end }}
+    send_resolved: true
+    
+# =================================
+# Critical Alert Receiver
+# =================================
+
+- name: 'critical-alerts'
+  email_configs:
+  - to: 'fortress-oncall@pat.local'
+    subject: '🚨 CRITICAL FORTRESS ALERT - {{ .GroupLabels.alertname }}'
+    html: |
+      <h2>🚨 Critical Alert in Pat Fortress</h2>
+      <table border="1" cellpadding="5" cellspacing="0">
+        <tr><th>Alert</th><th>Severity</th><th>Service</th><th>Description</th></tr>
+        {{ range .Alerts }}
+        <tr style="background-color: #ffebee;">
+          <td><strong>{{ .Annotations.summary }}</strong></td>
+          <td>{{ .Labels.severity }}</td>
+          <td>{{ .Labels.service }}</td>
+          <td>{{ .Annotations.description }}</td>
+        </tr>
+        {{ end }}
+      </table>
+      <p><strong>Action Required:</strong> Immediate investigation needed</p>
+      <p><em>Sent at: {{ .Alerts | first | index .StartsAt }}</em></p>
+    send_resolved: true
+    
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#fortress-critical'
+    title: '🚨 CRITICAL FORTRESS ALERT'
+    text: |
+      <!here> Critical issue detected in Pat Fortress
+      {{ range .Alerts }}
+      *Alert:* {{ .Annotations.summary }}
+      *Service:* {{ .Labels.service }}
+      *Severity:* {{ .Labels.severity }}
+      *Description:* {{ .Annotations.description }}
+      {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+      {{ end }}
+    send_resolved: true
+    color: 'danger'
+    
+  webhook_configs:
+  - url: '${PAGERDUTY_WEBHOOK_URL}'
+    http_config:
+      bearer_token: '${PAGERDUTY_TOKEN}'
+    send_resolved: true
+
+# =================================
+# Team-Specific Receivers
+# =================================
+
+- name: 'database-team'
+  email_configs:
+  - to: 'database-team@pat.local'
+    subject: 'Database Alert - {{ .GroupLabels.alertname }}'
+    html: |
+      <h3>Database System Alert</h3>
+      {{ range .Alerts }}
+      <p><strong>{{ .Annotations.summary }}</strong></p>
+      <p>{{ .Annotations.description }}</p>
+      <p>Service: {{ .Labels.service }} | Severity: {{ .Labels.severity }}</p>
+      {{ end }}
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#database-alerts'
+    title: 'Database Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'security-team'
+  email_configs:
+  - to: 'security-team@pat.local'
+    subject: '🔒 SECURITY ALERT - {{ .GroupLabels.alertname }}'
+    html: |
+      <h3 style="color: red;">🔒 Security Alert</h3>
+      {{ range .Alerts }}
+      <div style="border: 2px solid red; padding: 10px; margin: 10px 0;">
+        <h4>{{ .Annotations.summary }}</h4>
+        <p><strong>Description:</strong> {{ .Annotations.description }}</p>
+        <p><strong>Severity:</strong> {{ .Labels.severity }}</p>
+        <p><strong>Service:</strong> {{ .Labels.service }}</p>
+        {{ if .Labels.source_ip }}<p><strong>Source IP:</strong> {{ .Labels.source_ip }}</p>{{ end }}
+      </div>
+      {{ end }}
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#security-alerts'
+    title: '🔒 Security Alert - {{ .GroupLabels.alertname }}'
+    color: 'warning'
+
+- name: 'core-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#fortress-core'
+    title: 'Core Service Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'email-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#email-processing'
+    title: 'Email Service Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'plugin-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#plugin-runtime'
+    title: 'Plugin Runtime Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'api-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#api-alerts'
+    title: 'API Service Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'business-team'
+  email_configs:
+  - to: 'business-team@pat.local'
+    subject: 'Business Metrics Alert - {{ .GroupLabels.alertname }}'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#business-metrics'
+    title: 'Business Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'performance-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#performance'
+    title: 'Performance Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'infrastructure-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#infrastructure'
+    title: 'Infrastructure Alert - {{ .GroupLabels.alertname }}'
+
+- name: 'network-team'
+  slack_configs:
+  - api_url: '${SLACK_API_URL}'
+    channel: '#network-ops'
+    title: 'Network Alert - {{ .GroupLabels.alertname }}'
+
+# =============================================================================
+# Inhibit Rules - Suppress Redundant Alerts
+# =============================================================================
+
+inhibit_rules:
+
+# Suppress warning alerts when critical alerts are firing
+- source_match:
+    severity: 'critical'
+  target_match:
+    severity: 'warning'
+  equal: ['alertname', 'instance', 'service']
+
+# Suppress individual service alerts when node is down
+- source_match:
+    alertname: 'NodeDown'
+  target_match_re:
+    alertname: '(FortressApplicationDown|DatabaseDown|RedisDown)'
+  equal: ['instance']
+
+# Suppress high resource usage alerts when application is down
+- source_match_re:
+    alertname: '.*Down'
+  target_match_re:
+    alertname: '(HighCPUUsage|HighMemoryUsage|HighDiskUsage)'
+  equal: ['instance']
+
+# Suppress downstream alerts when database is down
+- source_match_re:
+    alertname: '(PostgreSQLDown|RedisDown)'
+  target_match_re:
+    alertname: '(FortressApplicationDown|APIResponseTime|EmailProcessingLag)'
+  equal: ['instance']
+
+# =============================================================================
+# Templates - Custom Notification Templates
+# =============================================================================
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# =============================================================================
+# Global Configuration
+# =============================================================================
+
+# Silence configuration
+silences:
+  maintenance_mode_label: 'maintenance'
+  
+# API configuration
+api:
+  v2:
+    max_silences: 500
+    max_silence_duration: 24h
+    
+# Web UI configuration  
+web:
+  external_url: 'https://fortress.pat.local/alertmanager'
+  route_prefix: '/alertmanager'

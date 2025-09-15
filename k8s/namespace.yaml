@@ -1,0 +1,22 @@
+# =============================================================================
+# Pat Fortress - Kubernetes Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fortress
+  labels:
+    name: fortress
+    app.kubernetes.io/name: fortress
+    app.kubernetes.io/instance: fortress
+    app.kubernetes.io/version: "2.0.0"
+    app.kubernetes.io/component: namespace
+    app.kubernetes.io/part-of: pat-fortress
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    kubernetes.io/managed-by: "fortress-operator"
+    fortress.pat.io/environment: "production"
+    fortress.pat.io/region: "us-east-1"
+spec:
+  finalizers:
+  - kubernetes

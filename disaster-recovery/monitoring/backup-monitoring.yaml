@@ -1,0 +1,641 @@
+# =============================================================================
+# Pat Fortress Backup and Disaster Recovery Monitoring Configuration
+# =============================================================================
+# Prometheus rules and Grafana dashboards for comprehensive backup monitoring
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fortress-backup-monitoring-rules
+  namespace: fortress-system
+data:
+  backup-rules.yaml: |
+    groups:
+      - name: fortress.backup.rules
+        interval: 30s
+        rules:
+          # =============================================================================
+          # BACKUP SUCCESS RATE ALERTS
+          # =============================================================================
+          
+          - alert: FortressBackupFailed
+            expr: fortress_backup_success_total{job="fortress-backup"} == 0
+            for: 5m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup job failed"
+              description: "Backup job {{ $labels.backup_type }} has failed for {{ $labels.instance }}. Last successful backup was {{ $value }}m ago."
+              runbook_url: "https://docs.fortress.pat.local/runbooks/backup-failure"
+              
+          - alert: FortressBackupSuccessRateLow
+            expr: |
+              (
+                rate(fortress_backup_success_total{job="fortress-backup"}[24h]) /
+                rate(fortress_backup_attempts_total{job="fortress-backup"}[24h])
+              ) < 0.95
+            for: 15m
+            labels:
+              severity: warning
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup success rate is low"
+              description: "Backup success rate for {{ $labels.backup_type }} is {{ $value | humanizePercentage }} over the last 24 hours."
+              
+          # =============================================================================
+          # BACKUP DURATION ALERTS
+          # =============================================================================
+          
+          - alert: FortressBackupDurationHigh
+            expr: fortress_backup_duration_seconds{job="fortress-backup"} > 1800
+            for: 5m
+            labels:
+              severity: warning
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup taking too long"
+              description: "Backup job {{ $labels.backup_type }} is taking {{ $value | humanizeDuration }} to complete."
+              
+          - alert: FortressBackupDurationCritical
+            expr: fortress_backup_duration_seconds{job="fortress-backup"} > 3600
+            for: 2m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup duration critical"
+              description: "Backup job {{ $labels.backup_type }} has been running for {{ $value | humanizeDuration }}."
+              
+          # =============================================================================
+          # BACKUP SIZE ALERTS
+          # =============================================================================
+          
+          - alert: FortressBackupSizeUnexpected
+            expr: |
+              abs(
+                fortress_backup_size_bytes{job="fortress-backup"} - 
+                avg_over_time(fortress_backup_size_bytes{job="fortress-backup"}[7d])
+              ) / avg_over_time(fortress_backup_size_bytes{job="fortress-backup"}[7d]) > 0.5
+            for: 10m
+            labels:
+              severity: warning
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup size unexpected"
+              description: "Backup {{ $labels.backup_type }} size is {{ $value | humanizeBytes }}, which deviates significantly from the 7-day average."
+              
+          - alert: FortressBackupSizeZero
+            expr: fortress_backup_size_bytes{job="fortress-backup"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup has zero size"
+              description: "Backup {{ $labels.backup_type }} has zero size, indicating a potential backup failure."
+              
+          # =============================================================================
+          # STORAGE CAPACITY ALERTS
+          # =============================================================================
+          
+          - alert: FortressBackupStorageLow
+            expr: |
+              (
+                fortress_backup_storage_used_bytes{job="fortress-backup"} /
+                fortress_backup_storage_total_bytes{job="fortress-backup"}
+              ) > 0.85
+            for: 5m
+            labels:
+              severity: warning
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup storage running low"
+              description: "Backup storage {{ $labels.storage_tier }} is {{ $value | humanizePercentage }} full."
+              
+          - alert: FortressBackupStorageCritical
+            expr: |
+              (
+                fortress_backup_storage_used_bytes{job="fortress-backup"} /
+                fortress_backup_storage_total_bytes{job="fortress-backup"}
+              ) > 0.95
+            for: 1m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup storage critically low"
+              description: "Backup storage {{ $labels.storage_tier }} is {{ $value | humanizePercentage }} full. Immediate action required."
+              
+          # =============================================================================
+          # REPLICATION LAG ALERTS
+          # =============================================================================
+          
+          - alert: FortressDatabaseReplicationLagHigh
+            expr: fortress_postgres_replication_lag_seconds{job="fortress-postgres"} > 300
+            for: 2m
+            labels:
+              severity: warning
+              component: database
+              service: fortress
+            annotations:
+              summary: "Fortress database replication lag is high"
+              description: "PostgreSQL replication lag is {{ $value | humanizeDuration }} on {{ $labels.instance }}."
+              
+          - alert: FortressDatabaseReplicationLagCritical
+            expr: fortress_postgres_replication_lag_seconds{job="fortress-postgres"} > 600
+            for: 1m
+            labels:
+              severity: critical
+              component: database
+              service: fortress
+            annotations:
+              summary: "Fortress database replication lag is critical"
+              description: "PostgreSQL replication lag is {{ $value | humanizeDuration }} on {{ $labels.instance }}. RPO at risk."
+              
+          - alert: FortressRedisReplicationLagHigh
+            expr: fortress_redis_replication_lag_seconds{job="fortress-redis"} > 60
+            for: 2m
+            labels:
+              severity: warning
+              component: cache
+              service: fortress
+            annotations:
+              summary: "Fortress Redis replication lag is high"
+              description: "Redis replication lag is {{ $value | humanizeDuration }} on {{ $labels.instance }}."
+              
+          # =============================================================================
+          # BACKUP INTEGRITY ALERTS
+          # =============================================================================
+          
+          - alert: FortressBackupIntegrityCheckFailed
+            expr: fortress_backup_integrity_check_success{job="fortress-backup"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup integrity check failed"
+              description: "Backup integrity verification failed for {{ $labels.backup_type }} on {{ $labels.instance }}."
+              
+          - alert: FortressBackupRestoreTestFailed
+            expr: fortress_backup_restore_test_success{job="fortress-backup"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: backup
+              service: fortress
+            annotations:
+              summary: "Fortress backup restore test failed"
+              description: "Backup restore test failed for {{ $labels.backup_type }} on {{ $labels.instance }}."
+              
+          # =============================================================================
+          # DISASTER RECOVERY ALERTS
+          # =============================================================================
+          
+          - alert: FortressDRTestFailed
+            expr: fortress_dr_test_success{job="fortress-dr"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: disaster_recovery
+              service: fortress
+            annotations:
+              summary: "Fortress disaster recovery test failed"
+              description: "Disaster recovery test {{ $labels.test_type }} failed on {{ $labels.instance }}."
+              
+          - alert: FortressRTOViolation
+            expr: fortress_recovery_time_seconds{job="fortress-dr"} > 900
+            for: 1m
+            labels:
+              severity: critical
+              component: disaster_recovery
+              service: fortress
+            annotations:
+              summary: "Fortress RTO violation"
+              description: "Recovery time {{ $value | humanizeDuration }} exceeds RTO target of 15 minutes for {{ $labels.service_type }}."
+              
+          - alert: FortressRPOViolation
+            expr: fortress_recovery_point_lag_seconds{job="fortress-dr"} > 300
+            for: 1m
+            labels:
+              severity: critical
+              component: disaster_recovery
+              service: fortress
+            annotations:
+              summary: "Fortress RPO violation"
+              description: "Recovery point lag {{ $value | humanizeDuration }} exceeds RPO target of 5 minutes."
+              
+          # =============================================================================
+          # SERVICE HEALTH ALERTS
+          # =============================================================================
+          
+          - alert: FortressServiceDown
+            expr: up{job=~"fortress-.*"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: service
+              service: fortress
+            annotations:
+              summary: "Fortress service is down"
+              description: "Service {{ $labels.job }} is down on {{ $labels.instance }}."
+              
+          - alert: FortressServiceUnhealthy
+            expr: fortress_service_health_status{job=~"fortress-.*"} == 0
+            for: 2m
+            labels:
+              severity: warning
+              component: service
+              service: fortress
+            annotations:
+              summary: "Fortress service is unhealthy"
+              description: "Service {{ $labels.job }} is reporting unhealthy status on {{ $labels.instance }}."
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fortress-backup-dashboard
+  namespace: fortress-system
+data:
+  dashboard.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Fortress Backup & Disaster Recovery",
+        "tags": ["fortress", "backup", "disaster-recovery"],
+        "timezone": "utc",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Backup Success Rate",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "rate(fortress_backup_success_total[24h]) / rate(fortress_backup_attempts_total[24h])",
+                "legendFormat": "Success Rate"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percentunit",
+                "min": 0,
+                "max": 1,
+                "thresholds": {
+                  "steps": [
+                    {"color": "red", "value": 0},
+                    {"color": "yellow", "value": 0.95},
+                    {"color": "green", "value": 0.99}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Backup Duration",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "fortress_backup_duration_seconds",
+                "legendFormat": "{{backup_type}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "s",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear"
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 18, "x": 6, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Storage Usage",
+            "type": "piechart",
+            "targets": [
+              {
+                "expr": "fortress_backup_storage_used_bytes",
+                "legendFormat": "{{storage_tier}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "bytes"
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Replication Lag",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "fortress_postgres_replication_lag_seconds",
+                "legendFormat": "PostgreSQL"
+              },
+              {
+                "expr": "fortress_redis_replication_lag_seconds", 
+                "legendFormat": "Redis"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "s",
+                "custom": {
+                  "thresholds": [
+                    {"color": "green", "value": 0},
+                    {"color": "yellow", "value": 60},
+                    {"color": "red", "value": 300}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+          {
+            "id": 5,
+            "title": "Backup Size Trends",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "fortress_backup_size_bytes",
+                "legendFormat": "{{backup_type}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "bytes"
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          },
+          {
+            "id": 6,
+            "title": "Recovery Metrics",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "fortress_recovery_time_seconds",
+                "legendFormat": "{{service_type}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "custom": {
+                  "displayMode": "table"
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+          },
+          {
+            "id": 7,
+            "title": "Service Health Status",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "fortress_service_health_status",
+                "legendFormat": "{{job}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"value": 0, "text": "Unhealthy", "color": "red"},
+                  {"value": 1, "text": "Healthy", "color": "green"}
+                ]
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+          }
+        ],
+        "time": {
+          "from": "now-24h",
+          "to": "now"
+        },
+        "refresh": "30s"
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fortress-alertmanager-config
+  namespace: fortress-system
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: 'localhost:587'
+      smtp_from: 'alerts@fortress.pat.local'
+      smtp_auth_username: 'fortress-alerts'
+      smtp_auth_password: 'fortress_smtp_password'
+      slack_api_url: 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'
+
+    route:
+      group_by: ['alertname', 'cluster', 'service']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+      receiver: 'default'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'critical-alerts'
+          group_wait: 0s
+          repeat_interval: 5m
+        - match:
+            component: backup
+          receiver: 'backup-alerts'
+        - match:
+            component: disaster_recovery
+          receiver: 'dr-alerts'
+
+    receivers:
+      - name: 'default'
+        email_configs:
+          - to: 'ops@fortress.pat.local'
+            subject: '[Fortress] {{ .GroupLabels.alertname }}'
+            body: |
+              {{ range .Alerts }}
+              Alert: {{ .Annotations.summary }}
+              Description: {{ .Annotations.description }}
+              Labels: {{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}
+              {{ end }}
+
+      - name: 'critical-alerts'
+        email_configs:
+          - to: 'critical-ops@fortress.pat.local,oncall@fortress.pat.local'
+            subject: '[CRITICAL] Fortress Alert: {{ .GroupLabels.alertname }}'
+            body: |
+              🚨 CRITICAL ALERT 🚨
+              
+              {{ range .Alerts }}
+              Alert: {{ .Annotations.summary }}
+              Description: {{ .Annotations.description }}
+              Runbook: {{ .Annotations.runbook_url }}
+              
+              Labels: {{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}
+              {{ end }}
+        slack_configs:
+          - channel: '#fortress-critical'
+            color: 'danger'
+            title: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+        pagerduty_configs:
+          - routing_key: 'fortress-critical-incidents'
+            description: '{{ .GroupLabels.alertname }}'
+
+      - name: 'backup-alerts'
+        email_configs:
+          - to: 'backup-ops@fortress.pat.local'
+            subject: '[Backup] {{ .GroupLabels.alertname }}'
+            body: |
+              💾 Backup Alert
+              
+              {{ range .Alerts }}
+              Alert: {{ .Annotations.summary }}
+              Description: {{ .Annotations.description }}
+              {{ end }}
+        slack_configs:
+          - channel: '#fortress-backup'
+            color: 'warning'
+            title: '💾 Backup Alert: {{ .GroupLabels.alertname }}'
+
+      - name: 'dr-alerts'
+        email_configs:
+          - to: 'dr-team@fortress.pat.local,management@fortress.pat.local'
+            subject: '[DR] {{ .GroupLabels.alertname }}'
+            body: |
+              🏗️ Disaster Recovery Alert
+              
+              {{ range .Alerts }}
+              Alert: {{ .Annotations.summary }}
+              Description: {{ .Annotations.description }}
+              Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}
+        slack_configs:
+          - channel: '#fortress-dr'
+            color: 'danger'
+            title: '🏗️ DR Alert: {{ .GroupLabels.alertname }}'
+        pagerduty_configs:
+          - routing_key: 'fortress-dr-incidents'
+            description: 'DR: {{ .GroupLabels.alertname }}'
+
+    inhibit_rules:
+      - source_match:
+          severity: 'critical'
+        target_match:
+          severity: 'warning'
+        equal: ['alertname', 'cluster', 'service']
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fortress-backup-metrics-config
+  namespace: fortress-system
+data:
+  metrics.yaml: |
+    # Prometheus scrape configuration for backup metrics
+    scrape_configs:
+      - job_name: 'fortress-backup'
+        static_configs:
+          - targets: ['fortress-backup-exporter:9100']
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        metrics_path: /metrics
+        
+      - job_name: 'fortress-dr'
+        static_configs:
+          - targets: ['fortress-dr-exporter:9101']
+        scrape_interval: 60s
+        scrape_timeout: 15s
+        
+      - job_name: 'fortress-storage'
+        static_configs:
+          - targets: ['fortress-storage-exporter:9102']
+        scrape_interval: 30s
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortress-backup-exporter
+  namespace: fortress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fortress-backup-exporter
+  template:
+    metadata:
+      labels:
+        app: fortress-backup-exporter
+    spec:
+      containers:
+        - name: backup-exporter
+          image: fortress/backup-exporter:latest
+          ports:
+            - containerPort: 9100
+              name: metrics
+          env:
+            - name: BACKUP_METRICS_PATH
+              value: "/var/log/fortress/backup"
+            - name: LISTEN_ADDRESS
+              value: "0.0.0.0:9100"
+          volumeMounts:
+            - name: backup-logs
+              mountPath: /var/log/fortress/backup
+              readOnly: true
+            - name: backup-config
+              mountPath: /etc/fortress/backup
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: backup-logs
+          hostPath:
+            path: /var/log/fortress/backup
+        - name: backup-config
+          configMap:
+            name: fortress-backup-monitoring-rules
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortress-backup-exporter
+  namespace: fortress-system
+  labels:
+    app: fortress-backup-exporter
+spec:
+  ports:
+    - port: 9100
+      targetPort: 9100
+      name: metrics
+  selector:
+    app: fortress-backup-exporter

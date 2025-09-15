@@ -1,0 +1,169 @@
+{
+  "namespace": "pat.events.v1",
+  "name": "PatEvents",
+  "type": "record",
+  "fields": [
+    {
+      "name": "EmailReceived",
+      "type": {
+        "type": "record",
+        "name": "EmailReceivedEvent",
+        "fields": [
+          {
+            "name": "metadata",
+            "type": {
+              "type": "record",
+              "name": "EventMetadata",
+              "fields": [
+                {"name": "eventId", "type": "string"},
+                {"name": "correlationId", "type": "string"},
+                {"name": "source", "type": "string"},
+                {"name": "timestamp", "type": "long", "logicalType": "timestamp-millis"},
+                {"name": "tenantId", "type": ["null", "string"], "default": null},
+                {"name": "userId", "type": ["null", "string"], "default": null},
+                {"name": "attributes", "type": {"type": "map", "values": "string"}}
+              ]
+            }
+          },
+          {"name": "emailId", "type": "string"},
+          {"name": "messageId", "type": "string"},
+          {
+            "name": "from",
+            "type": {
+              "type": "record",
+              "name": "EmailAddress",
+              "fields": [
+                {"name": "address", "type": "string"},
+                {"name": "name", "type": ["null", "string"], "default": null}
+              ]
+            }
+          },
+          {"name": "to", "type": {"type": "array", "items": "EmailAddress"}},
+          {"name": "cc", "type": {"type": "array", "items": "EmailAddress"}},
+          {"name": "bcc", "type": {"type": "array", "items": "EmailAddress"}},
+          {"name": "subject", "type": "string"},
+          {"name": "textBody", "type": ["null", "string"], "default": null},
+          {"name": "htmlBody", "type": ["null", "string"], "default": null},
+          {
+            "name": "attachments",
+            "type": {
+              "type": "array",
+              "items": {
+                "type": "record",
+                "name": "Attachment",
+                "fields": [
+                  {"name": "id", "type": "string"},
+                  {"name": "filename", "type": "string"},
+                  {"name": "contentType", "type": "string"},
+                  {"name": "size", "type": "long"},
+                  {"name": "s3Key", "type": "string"},
+                  {"name": "checksum", "type": "string"}
+                ]
+              }
+            }
+          },
+          {"name": "headers", "type": {"type": "map", "values": "string"}},
+          {"name": "rawEmail", "type": ["null", "string"], "default": null},
+          {"name": "protocol", "type": {"type": "enum", "name": "Protocol", "symbols": ["smtp", "http", "graphql", "websocket", "grpc"]}},
+          {"name": "sourceIp", "type": "string"},
+          {"name": "sourcePort", "type": "int"},
+          {"name": "receivedAt", "type": "long", "logicalType": "timestamp-millis"},
+          {"name": "sizeBytes", "type": "long"}
+        ]
+      }
+    },
+    {
+      "name": "EmailProcessed",
+      "type": {
+        "type": "record",
+        "name": "EmailProcessedEvent",
+        "fields": [
+          {"name": "metadata", "type": "EventMetadata"},
+          {"name": "emailId", "type": "string"},
+          {"name": "status", "type": {"type": "enum", "name": "ProcessingStatus", "symbols": ["success", "failed", "partial"]}},
+          {
+            "name": "result",
+            "type": {
+              "type": "record",
+              "name": "ProcessingResult",
+              "fields": [
+                {"name": "spamCheckPassed", "type": "boolean"},
+                {"name": "spamScore", "type": "float"},
+                {"name": "virusCheckPassed", "type": "boolean"},
+                {"name": "virusSignatures", "type": {"type": "array", "items": "string"}},
+                {"name": "dkimValid", "type": "boolean"},
+                {"name": "spfValid", "type": "boolean"},
+                {"name": "dmarcValid", "type": "boolean"}
+              ]
+            }
+          },
+          {"name": "appliedRules", "type": {"type": "array", "items": "string"}},
+          {"name": "executedPlugins", "type": {"type": "array", "items": "string"}},
+          {"name": "processedAt", "type": "long", "logicalType": "timestamp-millis"},
+          {"name": "processingDurationMs", "type": "long"},
+          {"name": "errorMessage", "type": ["null", "string"], "default": null},
+          {"name": "errorCode", "type": ["null", "string"], "default": null}
+        ]
+      }
+    },
+    {
+      "name": "EmailValidated",
+      "type": {
+        "type": "record",
+        "name": "EmailValidatedEvent",
+        "fields": [
+          {"name": "metadata", "type": "EventMetadata"},
+          {"name": "emailId", "type": "string"},
+          {
+            "name": "results",
+            "type": {
+              "type": "array",
+              "items": {
+                "type": "record",
+                "name": "ValidationResult",
+                "fields": [
+                  {"name": "ruleId", "type": "string"},
+                  {"name": "ruleName", "type": "string"},
+                  {"name": "passed", "type": "boolean"},
+                  {"name": "message", "type": "string"},
+                  {"name": "details", "type": {"type": "map", "values": "string"}}
+                ]
+              }
+            }
+          },
+          {"name": "overallValid", "type": "boolean"},
+          {"name": "validationProfile", "type": "string"},
+          {"name": "validatedAt", "type": "long", "logicalType": "timestamp-millis"}
+        ]
+      }
+    },
+    {
+      "name": "WorkflowTriggered",
+      "type": {
+        "type": "record",
+        "name": "WorkflowTriggeredEvent",
+        "fields": [
+          {"name": "metadata", "type": "EventMetadata"},
+          {"name": "workflowId", "type": "string"},
+          {"name": "workflowName", "type": "string"},
+          {"name": "triggerType", "type": {"type": "enum", "name": "TriggerType", "symbols": ["manual", "rule", "schedule", "api"]}},
+          {
+            "name": "context",
+            "type": {
+              "type": "record",
+              "name": "WorkflowContext",
+              "fields": [
+                {"name": "emailId", "type": ["null", "string"], "default": null},
+                {"name": "variables", "type": {"type": "map", "values": "string"}},
+                {"name": "tags", "type": {"type": "array", "items": "string"}}
+              ]
+            }
+          },
+          {"name": "priority", "type": {"type": "enum", "name": "Priority", "symbols": ["low", "medium", "high", "critical"]}},
+          {"name": "scheduledAt", "type": "long", "logicalType": "timestamp-millis"},
+          {"name": "initiatedBy", "type": "string"}
+        ]
+      }
+    }
+  ]
+}

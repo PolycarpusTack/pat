@@ -1,0 +1,185 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/pat-server
+/pat
+
+# Go
+vendor/
+*.mod.sum
+coverage.out
+coverage.html
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# TypeScript/JavaScript
+dist/
+build/
+*.tsbuildinfo
+.npm
+.eslintcache
+.node_repl_history
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.directory
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfplan
+*.tfvars
+!environments/*.tfvars
+.terraform.lock.hcl
+terraform/backend-config/*.hcl
+!terraform/backend-config/example.hcl
+
+# Serverless
+.serverless/
+.webpack/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# AWS
+.aws-sam/
+
+# Docker
+docker/data/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Build artifacts
+artifacts/
+target/
+out/
+
+# Local development
+.localstack/
+postgres-data/
+redis-data/
+elasticsearch-data/
+
+# Secrets (never commit these!)
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Backup files
+*.backup
+*.bak
+
+# Cache
+.cache/
+.parcel-cache/
+
+# Python (for scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+venv/
+ENV/
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Pat specific
+/data/
+/attachments/
+pat.db
+pat.log
+
+# Project status and progress tracking
+# (These files should be committed to track progress)
+# PROJECT_STATUS.md should be tracked
+# docs/tasks/ should be tracked for project management
+
+# Terraform temp files
+.terraform/tmp/
+terraform/.terraform/tmp/
+
+# Plugin development
+plugins/temp/
+plugins/uploads/
+
+# Local email storage
+emails/
+email-data/
+
+# Test data
+test-data/
+mock-data/
+
+# Generated files that should be ignored
+api/graphql/generated/
+pkg/events/generated/
+schemas/generated/
+
+# Next.js (when we add frontend)
+.next/
+out/
+
+# Turborepo
+.turbo/

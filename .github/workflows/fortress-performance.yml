@@ -1,0 +1,1215 @@
+name: ⚡ Fortress Performance Validation Pipeline
+
+on:
+  push:
+    branches: [main, develop, release/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run performance tests nightly at 4 AM UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of performance test to run'
+        required: true
+        type: choice
+        options:
+          - full
+          - load
+          - stress
+          - spike
+          - endurance
+          - baseline
+        default: 'full'
+      target_environment:
+        description: 'Target environment for testing'
+        required: false
+        type: choice
+        options:
+          - local
+          - staging
+          - production-mirror
+        default: 'local'
+      duration:
+        description: 'Test duration (e.g., 5m, 30m, 1h)'
+        required: false
+        type: string
+        default: '10m'
+
+env:
+  NODE_VERSION: '18'
+  GO_VERSION: '1.21'
+  K6_VERSION: '0.47.0'
+  
+  # Performance thresholds
+  MAX_P95_RESPONSE_TIME: 100  # milliseconds
+  MAX_P99_RESPONSE_TIME: 250  # milliseconds
+  MAX_ERROR_RATE: 0.01        # 1%
+  MIN_THROUGHPUT: 1000        # requests per second
+  MAX_CPU_USAGE: 80           # percentage
+  MAX_MEMORY_USAGE: 2048      # MB
+  
+  # Load test configuration
+  DEFAULT_VUS: 50             # Virtual users
+  MAX_VUS: 200               # Maximum virtual users
+  RAMP_UP_TIME: '2m'         # Time to ramp up to target VUs
+  STEADY_TIME: '5m'          # Time to maintain load
+  RAMP_DOWN_TIME: '1m'       # Time to ramp down
+
+jobs:
+  # ===== PERFORMANCE TEST SETUP =====
+  performance-setup:
+    name: 🔧 Performance Test Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    outputs:
+      test-config: ${{ steps.config.outputs.config }}
+      baseline-exists: ${{ steps.baseline.outputs.exists }}
+      
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_perf
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: ⚡ Install K6
+        run: |
+          curl -s https://github.com/grafana/k6/releases/download/v${{ env.K6_VERSION }}/k6-v${{ env.K6_VERSION }}-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v${{ env.K6_VERSION }}-linux-amd64/k6 /usr/local/bin/
+          k6 version
+          
+      - name: 🗃️ Setup Test Database
+        run: |
+          go mod download
+          go run ./cmd/migrate up
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          
+      - name: 📊 Load Test Data
+        run: |
+          # Generate test data for performance testing
+          cat > generate-test-data.sql << EOF
+          -- Insert test users
+          INSERT INTO users (id, email, created_at, updated_at) 
+          SELECT 
+            generate_random_uuid(),
+            'user' || generate_series(1, 1000) || '@example.com',
+            NOW() - (random() * INTERVAL '30 days'),
+            NOW() - (random() * INTERVAL '7 days')
+          ;
+          
+          -- Insert test emails
+          INSERT INTO emails (id, from_address, to_address, subject, body, created_at)
+          SELECT 
+            generate_random_uuid(),
+            'sender' || (random() * 100)::int || '@example.com',
+            'recipient' || (random() * 1000)::int || '@example.com',
+            'Test Subject ' || generate_series(1, 10000),
+            'Test email body content for performance testing. ' || repeat('Lorem ipsum dolor sit amet. ', 20),
+            NOW() - (random() * INTERVAL '30 days')
+          ;
+          
+          -- Insert test attachments
+          INSERT INTO attachments (id, email_id, filename, content_type, size, created_at)
+          SELECT 
+            generate_random_uuid(),
+            e.id,
+            'attachment_' || (random() * 1000)::int || '.pdf',
+            'application/pdf',
+            (random() * 1000000)::int,
+            e.created_at
+          FROM emails e 
+          WHERE random() < 0.3  -- 30% of emails have attachments
+          LIMIT 3000;
+          EOF
+          
+          PGPASSWORD=postgres psql -h localhost -U postgres -d pat_perf -f generate-test-data.sql
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          
+      - name: ⚙️ Configure Performance Test
+        id: config
+        run: |
+          # Determine test configuration based on inputs
+          case "${{ inputs.test_type }}" in
+            "load")
+              VUS=${{ env.DEFAULT_VUS }}
+              DURATION="${{ inputs.duration }}"
+              TEST_TYPE="load"
+              ;;
+            "stress")
+              VUS=${{ env.MAX_VUS }}
+              DURATION="${{ inputs.duration }}"
+              TEST_TYPE="stress"
+              ;;
+            "spike")
+              VUS=$((DEFAULT_VUS * 4))
+              DURATION="2m"
+              TEST_TYPE="spike"
+              ;;
+            "endurance")
+              VUS=${{ env.DEFAULT_VUS }}
+              DURATION="30m"
+              TEST_TYPE="endurance"
+              ;;
+            "baseline")
+              VUS=10
+              DURATION="5m"
+              TEST_TYPE="baseline"
+              ;;
+            *)
+              VUS=${{ env.DEFAULT_VUS }}
+              DURATION="${{ inputs.duration }}"
+              TEST_TYPE="full"
+              ;;
+          esac
+          
+          cat > performance-config.json << EOF
+          {
+            "test_type": "$TEST_TYPE",
+            "virtual_users": $VUS,
+            "duration": "$DURATION",
+            "target_environment": "${{ inputs.target_environment }}",
+            "thresholds": {
+              "p95_response_time": ${{ env.MAX_P95_RESPONSE_TIME }},
+              "p99_response_time": ${{ env.MAX_P99_RESPONSE_TIME }},
+              "error_rate": ${{ env.MAX_ERROR_RATE }},
+              "min_throughput": ${{ env.MIN_THROUGHPUT }}
+            }
+          }
+          EOF
+          
+          echo "config=$(cat performance-config.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📊 Check for Baseline Performance Data
+        id: baseline
+        run: |
+          # Check if we have baseline performance data to compare against
+          if [ -f "tests/performance/baseline-results.json" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Baseline performance data found"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "No baseline performance data found"
+          fi
+          
+      - name: 📤 Upload Test Configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-config-${{ github.sha }}
+          path: |
+            performance-config.json
+            generate-test-data.sql
+
+  # ===== GO BACKEND PERFORMANCE TESTS =====
+  backend-performance:
+    name: ⚡ Backend Performance Testing
+    runs-on: ubuntu-latest
+    needs: performance-setup
+    timeout-minutes: 45
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_perf
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    outputs:
+      backend-results: ${{ steps.backend-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 📥 Download Test Configuration
+        uses: actions/download-artifact@v4
+        with:
+          name: performance-config-${{ github.sha }}
+          
+      - name: 🗃️ Setup Database with Test Data
+        run: |
+          go mod download
+          go run ./cmd/migrate up
+          PGPASSWORD=postgres psql -h localhost -U postgres -d pat_perf -f generate-test-data.sql
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          
+      - name: 🔨 Build Application
+        run: |
+          go build -o pat-server -ldflags="-s -w" ./cmd/server
+          
+      - name: 🚀 Start Application with Monitoring
+        run: |
+          # Start application with performance monitoring
+          ./pat-server --config=config/performance.yml &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:8080/health; do sleep 2; done'
+          
+          echo "Application started successfully (PID: $APP_PID)"
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          REDIS_URL: redis://localhost:6379
+          PAT_LOG_LEVEL: warn
+          PAT_ENABLE_METRICS: true
+          
+      - name: ⚡ Go Benchmark Tests
+        run: |
+          mkdir -p performance-results
+          
+          echo "Running Go benchmark tests..."
+          go test -bench=. -benchmem -benchtime=30s -count=5 ./... > performance-results/go-benchmarks.txt
+          
+          # Extract key metrics
+          cat performance-results/go-benchmarks.txt | grep -E "Benchmark.*-[0-9]+" > performance-results/go-benchmark-summary.txt
+          
+      - name: ⚡ Database Performance Tests
+        run: |
+          echo "Running database performance tests..."
+          
+          # Test database query performance
+          cat > db-perf-test.go << 'EOF'
+          package main
+          
+          import (
+            "database/sql"
+            "fmt"
+            "log"
+            "time"
+            _ "github.com/lib/pq"
+          )
+          
+          func main() {
+            db, err := sql.Open("postgres", "postgres://postgres:postgres@localhost:5432/pat_perf?sslmode=disable")
+            if err != nil {
+              log.Fatal(err)
+            }
+            defer db.Close()
+            
+            // Test simple select
+            start := time.Now()
+            for i := 0; i < 1000; i++ {
+              var count int
+              db.QueryRow("SELECT COUNT(*) FROM emails").Scan(&count)
+            }
+            fmt.Printf("Simple SELECT (1000 queries): %v\n", time.Since(start))
+            
+            // Test complex join
+            start = time.Now()
+            for i := 0; i < 100; i++ {
+              rows, err := db.Query(`
+                SELECT e.id, e.subject, u.email, COUNT(a.id) 
+                FROM emails e 
+                JOIN users u ON e.from_address = u.email 
+                LEFT JOIN attachments a ON e.id = a.email_id 
+                GROUP BY e.id, u.email 
+                LIMIT 100
+              `)
+              if err == nil {
+                for rows.Next() {}
+                rows.Close()
+              }
+            }
+            fmt.Printf("Complex JOIN (100 queries): %v\n", time.Since(start))
+          }
+          EOF
+          
+          go run db-perf-test.go > performance-results/db-performance.txt
+          
+      - name: ⚡ Memory and CPU Profiling
+        run: |
+          echo "Starting CPU and memory profiling..."
+          
+          # Enable pprof endpoint
+          curl -s "http://localhost:8080/debug/pprof/profile?seconds=30" -o performance-results/cpu-profile.pb.gz &
+          PROFILE_PID=$!
+          
+          # Run memory profiling
+          curl -s "http://localhost:8080/debug/pprof/heap" -o performance-results/heap-profile.pb.gz &
+          
+          # Monitor system resources
+          top -b -n 30 -d 1 -p $APP_PID > performance-results/system-resources.txt &
+          TOP_PID=$!
+          
+          # Wait for profiling to complete
+          wait $PROFILE_PID
+          sleep 5
+          kill $TOP_PID 2>/dev/null || true
+          
+          echo "Profiling completed"
+          
+      - name: 📊 Analyze Backend Performance Results
+        id: backend-results
+        run: |
+          echo "Analyzing backend performance results..."
+          
+          # Parse Go benchmark results
+          if [ -f "performance-results/go-benchmarks.txt" ]; then
+            # Extract average execution time and memory usage
+            AVG_CPU_TIME=$(grep -E "BenchmarkEmail.*ns/op" performance-results/go-benchmarks.txt | awk '{sum+=$(NF-1); count++} END {print sum/count}' || echo "0")
+            AVG_MEMORY=$(grep -E "BenchmarkEmail.*B/op" performance-results/go-benchmarks.txt | awk '{sum+=$(NF-3); count++} END {print sum/count}' || echo "0")
+            
+            echo "Average CPU time per operation: ${AVG_CPU_TIME}ns"
+            echo "Average memory per operation: ${AVG_MEMORY}B"
+          fi
+          
+          # Analyze system resource usage
+          if [ -f "performance-results/system-resources.txt" ]; then
+            MAX_CPU=$(grep -E "^\s*$APP_PID" performance-results/system-resources.txt | awk '{print $9}' | sort -n | tail -1 || echo "0")
+            MAX_MEMORY=$(grep -E "^\s*$APP_PID" performance-results/system-resources.txt | awk '{print $10}' | sort -n | tail -1 || echo "0")
+            
+            echo "Maximum CPU usage: ${MAX_CPU}%"
+            echo "Maximum memory usage: ${MAX_MEMORY}%"
+            
+            # Check against thresholds
+            CPU_EXCEEDED=$( (( $(echo "$MAX_CPU > $MAX_CPU_USAGE" | bc -l) )) && echo "true" || echo "false")
+            MEMORY_MB=$(echo "$MAX_MEMORY * 20" | bc)  # Rough calculation
+            MEMORY_EXCEEDED=$( (( $(echo "$MEMORY_MB > $MAX_MEMORY_USAGE" | bc -l) )) && echo "true" || echo "false")
+          fi
+          
+          # Generate backend performance summary
+          cat > performance-results/backend-summary.json << EOF
+          {
+            "test_type": "backend",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "metrics": {
+              "avg_cpu_time_ns": ${AVG_CPU_TIME:-0},
+              "avg_memory_bytes": ${AVG_MEMORY:-0},
+              "max_cpu_percent": ${MAX_CPU:-0},
+              "max_memory_mb": ${MEMORY_MB:-0}
+            },
+            "thresholds": {
+              "cpu_exceeded": ${CPU_EXCEEDED:-false},
+              "memory_exceeded": ${MEMORY_EXCEEDED:-false}
+            }
+          }
+          EOF
+          
+          echo "results=$(cat performance-results/backend-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 🛑 Cleanup
+        if: always()
+        run: |
+          if [ -n "$APP_PID" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+          
+      - name: 📤 Upload Backend Performance Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-performance-results-${{ github.sha }}
+          path: performance-results/
+
+  # ===== LOAD TESTING WITH K6 =====
+  load-testing:
+    name: 🔥 Load Testing with K6
+    runs-on: ubuntu-latest
+    needs: [performance-setup, backend-performance]
+    timeout-minutes: 60
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_perf
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    outputs:
+      load-test-results: ${{ steps.load-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: ⚡ Install K6
+        run: |
+          curl -s https://github.com/grafana/k6/releases/download/v${{ env.K6_VERSION }}/k6-v${{ env.K6_VERSION }}-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v${{ env.K6_VERSION }}-linux-amd64/k6 /usr/local/bin/
+          
+      - name: 📥 Download Test Configuration
+        uses: actions/download-artifact@v4
+        with:
+          name: performance-config-${{ github.sha }}
+          
+      - name: 🗃️ Setup Database with Test Data
+        run: |
+          go mod download
+          go run ./cmd/migrate up
+          PGPASSWORD=postgres psql -h localhost -U postgres -d pat_perf -f generate-test-data.sql
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          
+      - name: 🔨 Build and Start Application
+        run: |
+          go build -o pat-server -ldflags="-s -w" ./cmd/server
+          
+          ./pat-server --config=config/performance.yml &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+          
+          timeout 60 bash -c 'until curl -f http://localhost:8080/health; do sleep 2; done'
+          echo "Application ready for load testing"
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          REDIS_URL: redis://localhost:6379
+          
+      - name: 📝 Create K6 Load Test Scripts
+        run: |
+          mkdir -p k6-tests
+          
+          # Main load test script
+          cat > k6-tests/load-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          import { Counter, Rate, Trend } from 'k6/metrics';
+          
+          // Custom metrics
+          export let errorRate = new Rate('errors');
+          export let emailCreateTime = new Trend('email_create_time');
+          export let emailSearchTime = new Trend('email_search_time');
+          
+          // Test configuration from environment
+          const CONFIG = JSON.parse(__ENV.K6_CONFIG || '{}');
+          
+          export let options = {
+            stages: [
+              { duration: CONFIG.ramp_up || '2m', target: CONFIG.virtual_users || 50 },
+              { duration: CONFIG.duration || '5m', target: CONFIG.virtual_users || 50 },
+              { duration: CONFIG.ramp_down || '1m', target: 0 },
+            ],
+            thresholds: {
+              http_req_duration: [`p(95)<${CONFIG.p95_threshold || 100}`],
+              http_req_failed: [`rate<${CONFIG.error_threshold || 0.01}`],
+              email_create_time: ['p(95)<200'],
+              email_search_time: ['p(95)<50'],
+            },
+          };
+          
+          const BASE_URL = 'http://localhost:8080';
+          
+          export default function () {
+            let responses = {};
+            
+            // Health check
+            responses.health = http.get(`${BASE_URL}/health`);
+            check(responses.health, {
+              'health check status is 200': (r) => r.status === 200,
+            });
+            
+            // Get emails list
+            let searchStart = Date.now();
+            responses.emails = http.get(`${BASE_URL}/api/v1/emails?limit=20`);
+            emailSearchTime.add(Date.now() - searchStart);
+            
+            check(responses.emails, {
+              'emails list status is 200': (r) => r.status === 200,
+              'emails list response time < 100ms': (r) => r.timings.duration < 100,
+            });
+            
+            // Search emails
+            responses.search = http.get(`${BASE_URL}/api/v1/emails?search=test&limit=10`);
+            check(responses.search, {
+              'email search status is 200': (r) => r.status === 200,
+            });
+            
+            // Get specific email
+            if (responses.emails.status === 200) {
+              const emails = JSON.parse(responses.emails.body);
+              if (emails.data && emails.data.length > 0) {
+                const emailId = emails.data[0].id;
+                responses.emailDetail = http.get(`${BASE_URL}/api/v1/emails/${emailId}`);
+                check(responses.emailDetail, {
+                  'email detail status is 200': (r) => r.status === 200,
+                });
+              }
+            }
+            
+            // Create new email (POST)
+            let createStart = Date.now();
+            const emailData = {
+              from: `user${Math.floor(Math.random() * 1000)}@example.com`,
+              to: `recipient${Math.floor(Math.random() * 1000)}@example.com`,
+              subject: `Load Test Email ${Date.now()}`,
+              body: 'This is a load test email generated by K6'
+            };
+            
+            responses.create = http.post(`${BASE_URL}/api/v1/emails`, JSON.stringify(emailData), {
+              headers: { 'Content-Type': 'application/json' },
+            });
+            emailCreateTime.add(Date.now() - createStart);
+            
+            check(responses.create, {
+              'email creation status is 201': (r) => r.status === 201,
+            });
+            
+            // Track errors
+            Object.values(responses).forEach(response => {
+              errorRate.add(response.status !== 200 && response.status !== 201);
+            });
+            
+            sleep(1);
+          }
+          EOF
+          
+          # Stress test script
+          cat > k6-tests/stress-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check } from 'k6';
+          
+          export let options = {
+            stages: [
+              { duration: '2m', target: 100 },   // Ramp up to 100 users
+              { duration: '5m', target: 100 },   // Stay at 100 users
+              { duration: '2m', target: 200 },   // Ramp up to 200 users  
+              { duration: '5m', target: 200 },   // Stay at 200 users
+              { duration: '2m', target: 0 },     // Ramp down
+            ],
+            thresholds: {
+              http_req_duration: ['p(95)<500'],   // Higher threshold for stress test
+              http_req_failed: ['rate<0.05'],     // Allow higher error rate
+            },
+          };
+          
+          export default function () {
+            const response = http.get('http://localhost:8080/api/v1/emails?limit=50');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+            });
+          }
+          EOF
+          
+          # Spike test script  
+          cat > k6-tests/spike-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check } from 'k6';
+          
+          export let options = {
+            stages: [
+              { duration: '10s', target: 10 },    // Normal load
+              { duration: '1m', target: 300 },    // Spike to 300 users
+              { duration: '10s', target: 10 },    // Back to normal
+            ],
+            thresholds: {
+              http_req_duration: ['p(95)<1000'],  // Allow higher response time
+              http_req_failed: ['rate<0.1'],      // Allow higher error rate
+            },
+          };
+          
+          export default function () {
+            const response = http.get('http://localhost:8080/health');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+            });
+          }
+          EOF
+          
+      - name: 🔥 Run K6 Load Tests
+        run: |
+          mkdir -p k6-results
+          
+          # Parse configuration
+          TEST_TYPE=$(jq -r '.test_type' performance-config.json)
+          VIRTUAL_USERS=$(jq -r '.virtual_users' performance-config.json)
+          DURATION=$(jq -r '.duration' performance-config.json)
+          
+          # Set K6 configuration
+          export K6_CONFIG=$(cat performance-config.json)
+          
+          echo "Running K6 load tests (Type: $TEST_TYPE, VUs: $VIRTUAL_USERS, Duration: $DURATION)"
+          
+          case "$TEST_TYPE" in
+            "stress")
+              k6 run k6-tests/stress-test.js --out json=k6-results/stress-results.json
+              ;;
+            "spike")
+              k6 run k6-tests/spike-test.js --out json=k6-results/spike-results.json
+              ;;
+            *)
+              k6 run k6-tests/load-test.js --out json=k6-results/load-results.json
+              ;;
+          esac
+          
+          echo "K6 load testing completed"
+          
+      - name: 📊 Analyze Load Test Results
+        id: load-results
+        run: |
+          echo "Analyzing K6 load test results..."
+          
+          # Find the results file
+          RESULTS_FILE=$(find k6-results -name "*-results.json" | head -1)
+          
+          if [ -f "$RESULTS_FILE" ]; then
+            # Extract key metrics from K6 JSON output
+            # Note: K6 outputs NDJSON (newline-delimited JSON)
+            
+            # Get summary metrics (last line of output)
+            SUMMARY=$(tail -1 "$RESULTS_FILE")
+            
+            # Extract metrics
+            if echo "$SUMMARY" | jq -e '.type == "metric"' > /dev/null 2>&1; then
+              HTTP_REQ_DURATION_P95=$(echo "$SUMMARY" | jq -r '.data.thresholds."http_req_duration{p(95)}"[0].value // "0"')
+              HTTP_REQ_DURATION_P99=$(echo "$SUMMARY" | jq -r '.data.thresholds."http_req_duration{p(99)}"[0].value // "0"')
+              HTTP_REQ_FAILED_RATE=$(echo "$SUMMARY" | jq -r '.data.thresholds.http_req_failed[0].value // "0"')
+              HTTP_REQS_RATE=$(echo "$SUMMARY" | jq -r '.data.thresholds.http_reqs[0].value // "0"')
+            else
+              # Fallback: parse the entire file for metrics
+              HTTP_REQ_DURATION_P95=$(grep '"metric":"http_req_duration"' "$RESULTS_FILE" | tail -1 | jq -r '.data.value' || echo "0")
+              HTTP_REQ_FAILED_RATE=$(grep '"metric":"http_req_failed"' "$RESULTS_FILE" | tail -1 | jq -r '.data.rate' || echo "0")
+              HTTP_REQS_RATE=$(grep '"metric":"http_reqs"' "$RESULTS_FILE" | tail -1 | jq -r '.data.rate' || echo "0")
+              HTTP_REQ_DURATION_P99=$HTTP_REQ_DURATION_P95
+            fi
+          else
+            echo "No K6 results file found"
+            HTTP_REQ_DURATION_P95=0
+            HTTP_REQ_DURATION_P99=0
+            HTTP_REQ_FAILED_RATE=0
+            HTTP_REQS_RATE=0
+          fi
+          
+          echo "Load Test Results:"
+          echo "P95 Response Time: ${HTTP_REQ_DURATION_P95}ms"
+          echo "P99 Response Time: ${HTTP_REQ_DURATION_P99}ms"
+          echo "Error Rate: ${HTTP_REQ_FAILED_RATE}"
+          echo "Throughput: ${HTTP_REQS_RATE} req/s"
+          
+          # Check against thresholds
+          P95_EXCEEDED=$( (( $(echo "$HTTP_REQ_DURATION_P95 > $MAX_P95_RESPONSE_TIME" | bc -l) )) && echo "true" || echo "false")
+          P99_EXCEEDED=$( (( $(echo "$HTTP_REQ_DURATION_P99 > $MAX_P99_RESPONSE_TIME" | bc -l) )) && echo "true" || echo "false")
+          ERROR_RATE_EXCEEDED=$( (( $(echo "$HTTP_REQ_FAILED_RATE > $MAX_ERROR_RATE" | bc -l) )) && echo "true" || echo "false")
+          THROUGHPUT_LOW=$( (( $(echo "$HTTP_REQS_RATE < $MIN_THROUGHPUT" | bc -l) )) && echo "true" || echo "false")
+          
+          # Generate load test summary
+          cat > k6-results/load-test-summary.json << EOF
+          {
+            "test_type": "load_test",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "metrics": {
+              "p95_response_time": $HTTP_REQ_DURATION_P95,
+              "p99_response_time": $HTTP_REQ_DURATION_P99,
+              "error_rate": $HTTP_REQ_FAILED_RATE,
+              "throughput": $HTTP_REQS_RATE
+            },
+            "thresholds": {
+              "p95_exceeded": $P95_EXCEEDED,
+              "p99_exceeded": $P99_EXCEEDED,
+              "error_rate_exceeded": $ERROR_RATE_EXCEEDED,
+              "throughput_low": $THROUGHPUT_LOW
+            }
+          }
+          EOF
+          
+          echo "results=$(cat k6-results/load-test-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 🛑 Cleanup
+        if: always()
+        run: |
+          if [ -n "$APP_PID" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+          
+      - name: 📤 Upload Load Test Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results-${{ github.sha }}
+          path: |
+            k6-results/
+            k6-tests/
+
+  # ===== FRONTEND PERFORMANCE TESTING =====
+  frontend-performance:
+    name: 🌐 Frontend Performance Testing
+    runs-on: ubuntu-latest
+    needs: performance-setup
+    timeout-minutes: 30
+    
+    outputs:
+      frontend-results: ${{ steps.frontend-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📥 Install Dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline
+        
+      - name: 🔨 Build Frontend
+        working-directory: frontend
+        run: |
+          npm run build
+          
+          # Analyze bundle size
+          npx webpack-bundle-analyzer dist/static/js/*.js --mode static --report bundle-analysis.html --no-open
+          
+      - name: 📊 Bundle Size Analysis
+        working-directory: frontend
+        run: |
+          mkdir -p ../frontend-performance-results
+          
+          # Calculate bundle sizes
+          MAIN_JS_SIZE=$(stat -c%s dist/static/js/main.*.js 2>/dev/null || echo "0")
+          VENDOR_JS_SIZE=$(stat -c%s dist/static/js/vendor.*.js 2>/dev/null || echo "0")
+          CSS_SIZE=$(stat -c%s dist/static/css/*.css 2>/dev/null || echo "0")
+          
+          TOTAL_JS_SIZE=$((MAIN_JS_SIZE + VENDOR_JS_SIZE))
+          
+          echo "Bundle Sizes:"
+          echo "Main JS: $(numfmt --to=iec $MAIN_JS_SIZE)"
+          echo "Vendor JS: $(numfmt --to=iec $VENDOR_JS_SIZE)"
+          echo "Total JS: $(numfmt --to=iec $TOTAL_JS_SIZE)"
+          echo "CSS: $(numfmt --to=iec $CSS_SIZE)"
+          
+          # Check against recommended sizes (250KB for main JS, 500KB for vendor)
+          MAIN_JS_EXCEEDED=$( [ $MAIN_JS_SIZE -gt 262144 ] && echo "true" || echo "false")  # 256KB
+          TOTAL_JS_EXCEEDED=$( [ $TOTAL_JS_SIZE -gt 524288 ] && echo "true" || echo "false")  # 512KB
+          
+          cat > ../frontend-performance-results/bundle-analysis.json << EOF
+          {
+            "main_js_size": $MAIN_JS_SIZE,
+            "vendor_js_size": $VENDOR_JS_SIZE,
+            "total_js_size": $TOTAL_JS_SIZE,
+            "css_size": $CSS_SIZE,
+            "main_js_exceeded": $MAIN_JS_EXCEEDED,
+            "total_js_exceeded": $TOTAL_JS_EXCEEDED
+          }
+          EOF
+          
+      - name: 🚀 Start Development Server
+        working-directory: frontend
+        run: |
+          npm run serve &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          
+          # Wait for server to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:3000; do sleep 2; done'
+          echo "Frontend server started"
+          
+      - name: ⚡ Lighthouse Performance Audit
+        run: |
+          # Install Lighthouse
+          npm install -g lighthouse
+          
+          mkdir -p frontend-performance-results
+          
+          # Run Lighthouse audit
+          lighthouse http://localhost:3000 \
+            --output json \
+            --output-path frontend-performance-results/lighthouse-report.json \
+            --chrome-flags="--headless --no-sandbox --disable-dev-shm-usage" \
+            --only-categories=performance
+            
+          # Extract key metrics
+          PERFORMANCE_SCORE=$(jq '.categories.performance.score * 100' frontend-performance-results/lighthouse-report.json)
+          FCP=$(jq '.audits["first-contentful-paint"].numericValue' frontend-performance-results/lighthouse-report.json)
+          LCP=$(jq '.audits["largest-contentful-paint"].numericValue' frontend-performance-results/lighthouse-report.json)
+          CLS=$(jq '.audits["cumulative-layout-shift"].numericValue' frontend-performance-results/lighthouse-report.json)
+          FID=$(jq '.audits["max-potential-fid"].numericValue' frontend-performance-results/lighthouse-report.json)
+          
+          echo "Lighthouse Performance Metrics:"
+          echo "Performance Score: ${PERFORMANCE_SCORE}/100"
+          echo "First Contentful Paint: ${FCP}ms"
+          echo "Largest Contentful Paint: ${LCP}ms"
+          echo "Cumulative Layout Shift: ${CLS}"
+          echo "First Input Delay: ${FID}ms"
+          
+      - name: 🧪 Jest Performance Tests
+        working-directory: frontend
+        run: |
+          # Run React component performance tests
+          npm run test:performance 2>&1 | tee ../frontend-performance-results/jest-performance.txt || true
+          
+      - name: 📊 Frontend Performance Summary
+        id: frontend-results
+        run: |
+          # Combine all frontend performance metrics
+          LIGHTHOUSE_DATA=$(cat frontend-performance-results/lighthouse-report.json)
+          BUNDLE_DATA=$(cat frontend-performance-results/bundle-analysis.json)
+          
+          PERFORMANCE_SCORE=$(echo "$LIGHTHOUSE_DATA" | jq '.categories.performance.score * 100')
+          FCP=$(echo "$LIGHTHOUSE_DATA" | jq '.audits["first-contentful-paint"].numericValue')
+          LCP=$(echo "$LIGHTHOUSE_DATA" | jq '.audits["largest-contentful-paint"].numericValue')
+          
+          # Check against Web Vitals thresholds
+          FCP_GOOD=$( (( $(echo "$FCP <= 1800" | bc -l) )) && echo "true" || echo "false")  # 1.8s
+          LCP_GOOD=$( (( $(echo "$LCP <= 2500" | bc -l) )) && echo "true" || echo "false")  # 2.5s
+          PERF_SCORE_GOOD=$( (( $(echo "$PERFORMANCE_SCORE >= 90" | bc -l) )) && echo "true" || echo "false")
+          
+          cat > frontend-performance-results/frontend-summary.json << EOF
+          {
+            "test_type": "frontend",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "lighthouse": {
+              "performance_score": $PERFORMANCE_SCORE,
+              "fcp": $FCP,
+              "lcp": $LCP,
+              "cls": $(echo "$LIGHTHOUSE_DATA" | jq '.audits["cumulative-layout-shift"].numericValue'),
+              "fid": $(echo "$LIGHTHOUSE_DATA" | jq '.audits["max-potential-fid"].numericValue')
+            },
+            "bundle": $(echo "$BUNDLE_DATA"),
+            "thresholds": {
+              "fcp_good": $FCP_GOOD,
+              "lcp_good": $LCP_GOOD,
+              "performance_score_good": $PERF_SCORE_GOOD
+            }
+          }
+          EOF
+          
+          echo "results=$(cat frontend-performance-results/frontend-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 🛑 Cleanup
+        if: always()
+        run: |
+          if [ -n "$SERVER_PID" ]; then
+            kill $SERVER_PID 2>/dev/null || true
+          fi
+          
+      - name: 📤 Upload Frontend Performance Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-performance-results-${{ github.sha }}
+          path: frontend-performance-results/
+
+  # ===== PERFORMANCE QUALITY GATE =====
+  performance-quality-gate:
+    name: 📊 Performance Quality Gate
+    runs-on: ubuntu-latest
+    needs: [performance-setup, backend-performance, load-testing, frontend-performance]
+    if: always()
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Download All Performance Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-performance-results-${{ github.sha }}'
+          merge-multiple: true
+          
+      - name: 📊 Aggregate Performance Results
+        run: |
+          echo "📊 Aggregating all performance test results..."
+          
+          mkdir -p final-performance-reports
+          
+          # Initialize summary data
+          cat > final-performance-reports/performance-summary.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit_sha": "${{ github.sha }}",
+            "test_configuration": $(echo "${{ needs.performance-setup.outputs.test-config }}" | base64 -d),
+            "results": {
+              "backend": {},
+              "load_test": {},
+              "frontend": {}
+            },
+            "quality_gate": {
+              "passed": false,
+              "failed_thresholds": []
+            }
+          }
+          EOF
+          
+          # Merge backend results
+          if [ -f "performance-results/backend-summary.json" ]; then
+            jq '.results.backend = input' final-performance-reports/performance-summary.json performance-results/backend-summary.json > temp.json && mv temp.json final-performance-reports/performance-summary.json
+          fi
+          
+          # Merge load test results  
+          if [ -f "k6-results/load-test-summary.json" ]; then
+            jq '.results.load_test = input' final-performance-reports/performance-summary.json k6-results/load-test-summary.json > temp.json && mv temp.json final-performance-reports/performance-summary.json
+          fi
+          
+          # Merge frontend results
+          if [ -f "frontend-performance-results/frontend-summary.json" ]; then
+            jq '.results.frontend = input' final-performance-reports/performance-summary.json frontend-performance-results/frontend-summary.json > temp.json && mv temp.json final-performance-reports/performance-summary.json
+          fi
+          
+          echo "Performance results aggregated successfully"
+          
+      - name: 🎯 Performance Quality Gate Validation
+        run: |
+          echo "🎯 Validating performance quality gates..."
+          
+          FAILED_THRESHOLDS=()
+          
+          # Check backend performance
+          if [ -f "performance-results/backend-summary.json" ]; then
+            CPU_EXCEEDED=$(jq -r '.thresholds.cpu_exceeded // false' performance-results/backend-summary.json)
+            MEMORY_EXCEEDED=$(jq -r '.thresholds.memory_exceeded // false' performance-results/backend-summary.json)
+            
+            if [ "$CPU_EXCEEDED" = "true" ]; then
+              FAILED_THRESHOLDS+=("Backend CPU usage exceeded threshold")
+            fi
+            
+            if [ "$MEMORY_EXCEEDED" = "true" ]; then
+              FAILED_THRESHOLDS+=("Backend memory usage exceeded threshold")
+            fi
+          fi
+          
+          # Check load test results
+          if [ -f "k6-results/load-test-summary.json" ]; then
+            P95_EXCEEDED=$(jq -r '.thresholds.p95_exceeded // false' k6-results/load-test-summary.json)
+            ERROR_RATE_EXCEEDED=$(jq -r '.thresholds.error_rate_exceeded // false' k6-results/load-test-summary.json)
+            THROUGHPUT_LOW=$(jq -r '.thresholds.throughput_low // false' k6-results/load-test-summary.json)
+            
+            if [ "$P95_EXCEEDED" = "true" ]; then
+              FAILED_THRESHOLDS+=("API P95 response time exceeded ${{ env.MAX_P95_RESPONSE_TIME }}ms threshold")
+            fi
+            
+            if [ "$ERROR_RATE_EXCEEDED" = "true" ]; then
+              FAILED_THRESHOLDS+=("API error rate exceeded ${{ env.MAX_ERROR_RATE }} threshold")
+            fi
+            
+            if [ "$THROUGHPUT_LOW" = "true" ]; then
+              FAILED_THRESHOLDS+=("API throughput below ${{ env.MIN_THROUGHPUT }} req/s threshold")
+            fi
+          fi
+          
+          # Check frontend performance
+          if [ -f "frontend-performance-results/frontend-summary.json" ]; then
+            PERF_SCORE_GOOD=$(jq -r '.thresholds.performance_score_good // false' frontend-performance-results/frontend-summary.json)
+            FCP_GOOD=$(jq -r '.thresholds.fcp_good // false' frontend-performance-results/frontend-summary.json)
+            LCP_GOOD=$(jq -r '.thresholds.lcp_good // false' frontend-performance-results/frontend-summary.json)
+            
+            if [ "$PERF_SCORE_GOOD" = "false" ]; then
+              FAILED_THRESHOLDS+=("Frontend Lighthouse performance score below 90")
+            fi
+            
+            if [ "$FCP_GOOD" = "false" ]; then
+              FAILED_THRESHOLDS+=("Frontend First Contentful Paint above 1.8s threshold")
+            fi
+            
+            if [ "$LCP_GOOD" = "false" ]; then
+              FAILED_THRESHOLDS+=("Frontend Largest Contentful Paint above 2.5s threshold")
+            fi
+          fi
+          
+          # Update quality gate status
+          if [ ${#FAILED_THRESHOLDS[@]} -eq 0 ]; then
+            echo "✅ ALL PERFORMANCE QUALITY GATES PASSED"
+            GATE_STATUS="passed"
+            echo "PERFORMANCE_GATE_STATUS=PASSED" >> $GITHUB_ENV
+          else
+            echo "❌ PERFORMANCE QUALITY GATES FAILED"
+            echo "The following performance thresholds were exceeded:"
+            printf '%s\n' "${FAILED_THRESHOLDS[@]}"
+            GATE_STATUS="failed"
+            echo "PERFORMANCE_GATE_STATUS=FAILED" >> $GITHUB_ENV
+          fi
+          
+          # Update summary with quality gate results
+          jq --arg status "$GATE_STATUS" \
+             --argjson failed_thresholds "$(printf '%s\n' "${FAILED_THRESHOLDS[@]}" | jq -R . | jq -s .)" \
+             '.quality_gate.passed = ($status == "passed") | .quality_gate.failed_thresholds = $failed_thresholds' \
+             final-performance-reports/performance-summary.json > temp.json && \
+             mv temp.json final-performance-reports/performance-summary.json
+          
+      - name: 📊 Generate Performance Dashboard
+        run: |
+          # Extract key metrics for dashboard
+          BACKEND_MAX_CPU=$(jq -r '.results.backend.metrics.max_cpu_percent // "N/A"' final-performance-reports/performance-summary.json)
+          BACKEND_MAX_MEMORY=$(jq -r '.results.backend.metrics.max_memory_mb // "N/A"' final-performance-reports/performance-summary.json)
+          
+          LOAD_P95_TIME=$(jq -r '.results.load_test.metrics.p95_response_time // "N/A"' final-performance-reports/performance-summary.json)
+          LOAD_ERROR_RATE=$(jq -r '.results.load_test.metrics.error_rate // "N/A"' final-performance-reports/performance-summary.json)
+          LOAD_THROUGHPUT=$(jq -r '.results.load_test.metrics.throughput // "N/A"' final-performance-reports/performance-summary.json)
+          
+          FRONTEND_PERF_SCORE=$(jq -r '.results.frontend.lighthouse.performance_score // "N/A"' final-performance-reports/performance-summary.json)
+          FRONTEND_FCP=$(jq -r '.results.frontend.lighthouse.fcp // "N/A"' final-performance-reports/performance-summary.json)
+          FRONTEND_LCP=$(jq -r '.results.frontend.lighthouse.lcp // "N/A"' final-performance-reports/performance-summary.json)
+          
+          cat > final-performance-reports/performance-dashboard.md << EOF
+          # ⚡ Fortress Performance Dashboard
+          
+          ## 📊 Performance Test Summary
+          
+          **Test Date**: $(date -u +%Y-%m-%d\ %H:%M:%S)\ UTC  
+          **Commit SHA**: \`${{ github.sha }}\`  
+          **Quality Gate Status**: ${{ env.PERFORMANCE_GATE_STATUS == 'PASSED' && '✅ PASSED' || '❌ FAILED' }}
+          
+          ### Backend Performance
+          
+          | Metric | Value | Threshold | Status |
+          |--------|-------|-----------|--------|
+          | Max CPU Usage | ${BACKEND_MAX_CPU}% | ≤ ${{ env.MAX_CPU_USAGE }}% | $([ "$BACKEND_MAX_CPU" != "N/A" ] && [ $(echo "$BACKEND_MAX_CPU <= $MAX_CPU_USAGE" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          | Max Memory Usage | ${BACKEND_MAX_MEMORY}MB | ≤ ${{ env.MAX_MEMORY_USAGE }}MB | $([ "$BACKEND_MAX_MEMORY" != "N/A" ] && [ $(echo "$BACKEND_MAX_MEMORY <= $MAX_MEMORY_USAGE" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          
+          ### Load Test Performance
+          
+          | Metric | Value | Threshold | Status |
+          |--------|-------|-----------|--------|
+          | P95 Response Time | ${LOAD_P95_TIME}ms | ≤ ${{ env.MAX_P95_RESPONSE_TIME }}ms | $([ "$LOAD_P95_TIME" != "N/A" ] && [ $(echo "$LOAD_P95_TIME <= $MAX_P95_RESPONSE_TIME" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          | Error Rate | ${LOAD_ERROR_RATE} | ≤ ${{ env.MAX_ERROR_RATE }} | $([ "$LOAD_ERROR_RATE" != "N/A" ] && [ $(echo "$LOAD_ERROR_RATE <= $MAX_ERROR_RATE" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          | Throughput | ${LOAD_THROUGHPUT} req/s | ≥ ${{ env.MIN_THROUGHPUT }} req/s | $([ "$LOAD_THROUGHPUT" != "N/A" ] && [ $(echo "$LOAD_THROUGHPUT >= $MIN_THROUGHPUT" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          
+          ### Frontend Performance
+          
+          | Metric | Value | Threshold | Status |
+          |--------|-------|-----------|--------|
+          | Lighthouse Score | ${FRONTEND_PERF_SCORE}/100 | ≥ 90/100 | $([ "$FRONTEND_PERF_SCORE" != "N/A" ] && [ $(echo "$FRONTEND_PERF_SCORE >= 90" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          | First Contentful Paint | ${FRONTEND_FCP}ms | ≤ 1800ms | $([ "$FRONTEND_FCP" != "N/A" ] && [ $(echo "$FRONTEND_FCP <= 1800" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          | Largest Contentful Paint | ${FRONTEND_LCP}ms | ≤ 2500ms | $([ "$FRONTEND_LCP" != "N/A" ] && [ $(echo "$FRONTEND_LCP <= 2500" | bc -l) -eq 1 ] && echo "✅" || echo "❌") |
+          
+          $([ "${{ env.PERFORMANCE_GATE_STATUS }}" = "PASSED" ] && echo "## ✅ Performance Quality Gates Passed
+          
+          All performance quality gates have been successfully validated. The application meets fortress-grade performance standards." || echo "## ❌ Performance Quality Gates Failed
+          
+          One or more performance quality gates have failed. Please optimize performance before deployment.")
+          
+          ---
+          
+          *Generated by Fortress Performance Pipeline*
+          EOF
+          
+      - name: 📊 Compare with Baseline (if available)
+        if: needs.performance-setup.outputs.baseline-exists == 'true'
+        run: |
+          echo "📊 Comparing with baseline performance data..."
+          
+          if [ -f "tests/performance/baseline-results.json" ]; then
+            # Simple comparison logic (in real implementation, this would be more sophisticated)
+            BASELINE_P95=$(jq -r '.load_test.p95_response_time // 0' tests/performance/baseline-results.json)
+            CURRENT_P95=$(jq -r '.results.load_test.metrics.p95_response_time // 0' final-performance-reports/performance-summary.json)
+            
+            if [ "$CURRENT_P95" != "0" ] && [ "$BASELINE_P95" != "0" ]; then
+              PERFORMANCE_CHANGE=$(echo "scale=2; (($CURRENT_P95 - $BASELINE_P95) / $BASELINE_P95) * 100" | bc)
+              
+              echo "" >> final-performance-reports/performance-dashboard.md
+              echo "### 📈 Performance Trend" >> final-performance-reports/performance-dashboard.md
+              echo "" >> final-performance-reports/performance-dashboard.md
+              echo "**P95 Response Time Change**: ${PERFORMANCE_CHANGE}% vs baseline" >> final-performance-reports/performance-dashboard.md
+              
+              if (( $(echo "$PERFORMANCE_CHANGE > 10" | bc -l) )); then
+                echo "⚠️  Performance regression detected" >> final-performance-reports/performance-dashboard.md
+              elif (( $(echo "$PERFORMANCE_CHANGE < -10" | bc -l) )); then
+                echo "🚀 Performance improvement detected" >> final-performance-reports/performance-dashboard.md
+              else
+                echo "➡️  Performance is stable" >> final-performance-reports/performance-dashboard.md
+              fi
+            fi
+          fi
+          
+      - name: 💾 Save New Baseline (if this is a baseline run)
+        if: inputs.test_type == 'baseline' || (github.ref == 'refs/heads/main' && env.PERFORMANCE_GATE_STATUS == 'PASSED')
+        run: |
+          echo "💾 Saving new performance baseline..."
+          
+          mkdir -p tests/performance
+          cp final-performance-reports/performance-summary.json tests/performance/baseline-results.json
+          
+          echo "New baseline saved"
+          
+      - name: 📤 Upload Final Performance Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-performance-reports-${{ github.sha }}
+          path: final-performance-reports/
+          
+      - name: 💬 Comment Performance Results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('final-performance-reports/performance-dashboard.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+            
+      - name: ❌ Fail Build if Performance Gates Failed
+        if: env.PERFORMANCE_GATE_STATUS == 'FAILED'
+        run: |
+          echo "❌ Performance quality gates failed. Build blocked for performance reasons."
+          echo "Please optimize application performance before proceeding."
+          exit 1

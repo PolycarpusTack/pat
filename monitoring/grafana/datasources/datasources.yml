@@ -1,0 +1,121 @@
+# =============================================================================
+# Pat Fortress - Grafana Data Sources Configuration
+# Automated provisioning of monitoring data sources
+# =============================================================================
+
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+  - name: Loki
+  - name: Jaeger
+
+datasources:
+
+# =============================================================================
+# Prometheus - Metrics Data Source
+# =============================================================================
+- name: Prometheus
+  type: prometheus
+  uid: fortress_prometheus
+  access: proxy
+  url: http://prometheus:9090
+  isDefault: true
+  version: 1
+  editable: false
+  jsonData:
+    httpMethod: POST
+    manageAlerts: true
+    prometheusType: Prometheus
+    prometheusVersion: 2.47.0
+    cacheLevel: 'High'
+    disableMetricsLookup: false
+    customQueryParameters: ''
+    timeInterval: '15s'
+  secureJsonData: {}
+
+# =============================================================================
+# Loki - Logs Data Source  
+# =============================================================================
+- name: Loki
+  type: loki
+  uid: fortress_loki
+  access: proxy
+  url: http://loki:3100
+  version: 1
+  editable: false
+  jsonData:
+    maxLines: 1000
+    derivedFields:
+      - datasourceUid: fortress_jaeger
+        matcherRegex: 'trace_id=([A-Fa-f0-9]+)'
+        name: TraceID
+        url: '$${__value.raw}'
+        urlDisplayLabel: 'View Trace'
+    alertmanager:
+      handleGrafanaManagedAlerts: true
+  secureJsonData: {}
+
+# =============================================================================
+# Jaeger - Distributed Tracing Data Source
+# =============================================================================  
+- name: Jaeger
+  type: jaeger
+  uid: fortress_jaeger
+  access: proxy
+  url: http://jaeger:16686
+  version: 1
+  editable: false
+  jsonData:
+    tracesToLogs:
+      datasourceUid: fortress_loki
+      tags: ['job', 'instance', 'pod', 'namespace']
+      mapTagNamesEnabled: true
+      mapTagNames:
+        - key: service.name
+          value: service
+        - key: service.namespace
+          value: namespace
+      spanStartTimeShift: '1h'
+      spanEndTimeShift: '1h'
+    tracesToMetrics:
+      datasourceUid: fortress_prometheus
+      tags:
+        - key: service.name
+          value: service
+        - key: service.namespace  
+          value: namespace
+    nodeGraph:
+      enabled: true
+    search:
+      hide: false
+    spanBar:
+      type: 'Tag'
+      tag: 'http.status_code'
+  secureJsonData: {}
+
+# =============================================================================
+# TestData - For Demo and Testing
+# =============================================================================
+- name: TestData
+  type: testdata
+  uid: fortress_testdata
+  access: proxy
+  version: 1
+  editable: false
+  jsonData: {}
+
+# =============================================================================
+# Alertmanager - Alert Management
+# =============================================================================
+- name: Alertmanager
+  type: alertmanager
+  uid: fortress_alertmanager
+  access: proxy
+  url: http://alertmanager:9093
+  version: 1
+  editable: false
+  jsonData:
+    implementation: prometheus
+    handleGrafanaManagedAlerts: false
+  secureJsonData: {}

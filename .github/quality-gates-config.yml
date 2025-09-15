@@ -1,0 +1,241 @@
+# 🛡️ Fortress Quality Gates Configuration
+# This file defines the quality gates and thresholds for the Pat Fortress CI/CD pipeline
+
+# ===== QUALITY GATE THRESHOLDS =====
+quality_gates:
+  # Unit Test Quality Gates
+  unit_tests:
+    coverage_threshold: 90          # Minimum code coverage percentage
+    mutation_score_threshold: 80    # Minimum mutation testing score
+    performance_threshold: 10       # Maximum test execution time (seconds)
+    flaky_test_threshold: 0         # Maximum number of flaky tests allowed
+    
+  # Integration Test Quality Gates
+  integration_tests:
+    pass_rate_threshold: 95         # Minimum test pass rate percentage
+    execution_time_threshold: 120   # Maximum execution time (seconds)
+    environment_validation: true    # Require environment validation
+    data_consistency_check: true    # Require data consistency validation
+    
+  # Security Quality Gates
+  security:
+    max_critical_vulnerabilities: 0    # Maximum critical vulnerabilities
+    max_high_vulnerabilities: 0        # Maximum high severity vulnerabilities
+    max_medium_vulnerabilities: 5      # Maximum medium severity vulnerabilities
+    min_security_score: 85             # Minimum overall security score
+    secrets_detection: true            # Block if secrets detected
+    license_compliance: true           # Require license compliance
+    
+  # Performance Quality Gates
+  performance:
+    api_response_time_p95: 100      # Maximum P95 response time (ms)
+    api_response_time_p99: 250      # Maximum P99 response time (ms)
+    max_error_rate: 0.01            # Maximum API error rate (1%)
+    min_throughput: 1000            # Minimum throughput (req/s)
+    max_cpu_usage: 80               # Maximum CPU usage (%)
+    max_memory_usage: 2048          # Maximum memory usage (MB)
+    frontend_lighthouse_score: 90   # Minimum Lighthouse performance score
+    frontend_fcp_threshold: 1800    # Maximum First Contentful Paint (ms)
+    frontend_lcp_threshold: 2500    # Maximum Largest Contentful Paint (ms)
+    
+  # Compliance Quality Gates
+  compliance:
+    min_compliance_score: 85        # Minimum overall compliance score
+    owasp_compliance: true          # Require OWASP Top 10 compliance
+    gdpr_compliance: true           # Require GDPR compliance (if applicable)
+    sox_compliance: true            # Require SOX compliance (if applicable)
+    pci_dss_compliance: false       # PCI DSS compliance (disable if not needed)
+    hipaa_compliance: false         # HIPAA compliance (disable if not needed)
+    
+  # Code Quality Gates
+  code_quality:
+    min_maintainability_rating: 'A'    # Minimum maintainability rating
+    max_code_smells: 10                # Maximum code smells
+    max_technical_debt_ratio: 5        # Maximum technical debt ratio (%)
+    max_duplicated_lines_density: 3    # Maximum duplicated lines density (%)
+    min_reliability_rating: 'A'        # Minimum reliability rating
+
+# ===== DEPLOYMENT STRATEGY CONFIGURATION =====
+deployment_strategies:
+  # Development environment
+  development:
+    strategy: 'rolling'
+    auto_deploy: true
+    require_approval: false
+    rollback_on_failure: true
+    health_check_timeout: '2m'
+    quality_gates_required:
+      - unit_tests
+      - security
+    
+  # Staging environment  
+  staging:
+    strategy: 'blue-green'
+    auto_deploy: true
+    require_approval: false
+    rollback_on_failure: true
+    health_check_timeout: '5m'
+    smoke_tests_required: true
+    quality_gates_required:
+      - unit_tests
+      - integration_tests
+      - security
+      - performance
+      
+  # Production environment
+  production:
+    strategy: 'canary'
+    auto_deploy: false
+    require_approval: true
+    rollback_on_failure: true
+    health_check_timeout: '10m'
+    smoke_tests_required: true
+    canary_steps: [10, 25, 50, 75, 100]  # Traffic percentage steps
+    quality_gates_required:
+      - unit_tests
+      - integration_tests
+      - security
+      - performance
+      - compliance
+      - code_quality
+
+# ===== ROLLBACK CONFIGURATION =====
+rollback_triggers:
+  # Automatic rollback conditions
+  automatic:
+    error_rate_threshold: 0.05         # Rollback if error rate > 5%
+    response_time_p95_threshold: 500   # Rollback if P95 > 500ms
+    cpu_usage_threshold: 95            # Rollback if CPU > 95%
+    memory_usage_threshold: 90         # Rollback if memory > 90%
+    health_check_failures: 3           # Rollback after 3 consecutive health check failures
+    timeout_minutes: 2                 # Time to wait before triggering rollback
+    
+  # Manual rollback settings
+  manual:
+    require_approval: true             # Require approval for manual rollback
+    preserve_logs: true                # Preserve logs during rollback
+    notification_required: true        # Send notifications on manual rollback
+
+# ===== NOTIFICATION CONFIGURATION =====
+notifications:
+  # Success notifications
+  success:
+    slack_webhook_enabled: true
+    email_enabled: false
+    teams_webhook_enabled: false
+    
+  # Failure notifications
+  failure:
+    slack_webhook_enabled: true
+    email_enabled: true
+    teams_webhook_enabled: false
+    pagerduty_enabled: false           # Enable for critical production issues
+    
+  # Quality gate failure notifications
+  quality_gate_failure:
+    slack_webhook_enabled: true
+    email_enabled: true
+    include_details: true
+    include_remediation_steps: true
+
+# ===== MONITORING AND OBSERVABILITY =====
+monitoring:
+  # Metrics collection
+  metrics:
+    prometheus_enabled: true
+    datadog_enabled: false
+    custom_metrics_enabled: true
+    
+  # Logging
+  logging:
+    centralized_logging: true
+    log_level: 'info'
+    retention_days: 30
+    
+  # Tracing
+  tracing:
+    jaeger_enabled: true
+    sample_rate: 0.1                   # 10% sampling rate
+    
+  # Alerting
+  alerting:
+    alert_manager_enabled: true
+    slack_alerts: true
+    email_alerts: true
+    webhook_alerts: false
+
+# ===== ADVANCED QUALITY GATE SETTINGS =====
+advanced_settings:
+  # Progressive quality gates (stricter for higher environments)
+  progressive_gates:
+    enabled: true
+    development_weight: 0.7            # 70% of quality gates required
+    staging_weight: 0.9                # 90% of quality gates required
+    production_weight: 1.0             # 100% of quality gates required
+    
+  # Quality gate bypass (emergency deployments)
+  emergency_bypass:
+    enabled: false                     # Disable by default for security
+    require_approval: true
+    require_justification: true
+    audit_trail: true
+    
+  # Trend analysis
+  trend_analysis:
+    enabled: true
+    baseline_comparison: true
+    regression_detection: true
+    improvement_tracking: true
+    
+  # Custom quality gates
+  custom_gates:
+    enabled: true
+    script_validation: true
+    security_scan_timeout: '30m'
+    performance_test_timeout: '45m'
+    compliance_check_timeout: '20m'
+
+# ===== ENVIRONMENT-SPECIFIC OVERRIDES =====
+environment_overrides:
+  # Development environment overrides
+  development:
+    security:
+      max_medium_vulnerabilities: 10   # More lenient for development
+    performance:
+      api_response_time_p95: 200       # Less strict performance requirements
+      
+  # Staging environment overrides  
+  staging:
+    compliance:
+      pci_dss_compliance: true         # Enable PCI DSS testing in staging
+      
+  # Production environment overrides
+  production:
+    security:
+      max_medium_vulnerabilities: 0    # No medium vulnerabilities in production
+    performance:
+      api_response_time_p95: 50        # Stricter performance in production
+    rollback_triggers:
+      automatic:
+        error_rate_threshold: 0.01     # More sensitive rollback in production
+
+# ===== PIPELINE TIMEOUTS =====
+timeouts:
+  total_pipeline_timeout: '120m'       # Maximum total pipeline execution time
+  quality_gate_timeout: '30m'          # Maximum time for quality gate validation
+  deployment_timeout: '20m'            # Maximum deployment time
+  rollback_timeout: '10m'              # Maximum rollback time
+  health_check_timeout: '5m'           # Maximum health check time
+
+# ===== ARTIFACT MANAGEMENT =====
+artifacts:
+  retention:
+    build_artifacts: 7                 # Days to retain build artifacts
+    test_reports: 30                   # Days to retain test reports
+    security_reports: 90               # Days to retain security reports
+    compliance_reports: 365            # Days to retain compliance reports
+    
+  storage:
+    compression_enabled: true
+    encryption_enabled: true
+    versioning_enabled: true

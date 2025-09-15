@@ -1,0 +1,243 @@
+# Technology Stack Specification for MailHog Rebuild
+# Version: 2.0.0
+# Generated: 2025-06-11
+
+current_stack:
+  language:
+    name: "Go"
+    version: "1.4+" # Based on vendor dependencies
+    actual_version: "1.18" # From Dockerfile
+  
+  dependencies:
+    web_framework:
+      - name: "gorilla/mux"
+        version: "2017-02-28"
+        purpose: "HTTP routing"
+        status: "outdated"
+      - name: "gorilla/pat"
+        version: "2016-04-13"
+        purpose: "URL pattern matching"
+        status: "outdated"
+      - name: "gorilla/websocket"
+        version: "2017-03-19"
+        purpose: "WebSocket support"
+        status: "vulnerable (CVE-2020-27813)"
+    
+    storage:
+      - name: "gopkg.in/mgo.v2"
+        version: "2016-06-09"
+        purpose: "MongoDB driver"
+        status: "abandoned"
+    
+    security:
+      - name: "golang.org/x/crypto"
+        version: "2016-12-21"
+        purpose: "BCrypt authentication"
+        status: "severely outdated"
+    
+    utilities:
+      - name: "ian-kent/go-log"
+        version: "2016-01-13"
+        purpose: "Logging"
+        status: "unmaintained"
+      - name: "ian-kent/envconf"
+        version: "2014-10-26"
+        purpose: "Environment config"
+        status: "unmaintained"
+      - name: "ian-kent/goose"
+        version: "2014-12-21"
+        purpose: "Server-Sent Events"
+        status: "unmaintained"
+  
+  build_tools:
+    - name: "Make"
+      version: "GNU Make"
+      purpose: "Build automation"
+    - name: "gox"
+      purpose: "Cross-compilation"
+      status: "replaced by Go 1.5+ built-in"
+  
+  deployment:
+    - name: "Docker"
+      base_image: "Alpine Linux"
+      multi_stage: true
+    - name: "Snapcraft"
+      purpose: "Snap package"
+
+recommended_stack:
+  language:
+    name: "Go"
+    version: "1.21+"
+    rationale: "Modern Go with generics and improved performance"
+  
+  dependencies:
+    web_framework:
+      - name: "gorilla/mux"
+        version: "1.8.1"
+        purpose: "HTTP routing"
+        rationale: "Mature, well-maintained"
+      - name: "gorilla/websocket"
+        version: "1.5.1"
+        purpose: "WebSocket support"
+        rationale: "Security patches applied"
+    
+    alternative_frameworks:
+      - name: "gin-gonic/gin"
+        version: "1.9.1"
+        purpose: "High-performance HTTP framework"
+        rationale: "Better performance, built-in middleware"
+      - name: "fiber"
+        version: "2.52.0"
+        purpose: "Express-inspired framework"
+        rationale: "Fastest Go web framework"
+    
+    storage:
+      - name: "go.mongodb.org/mongo-driver"
+        version: "1.13.1"
+        purpose: "Official MongoDB driver"
+        rationale: "Actively maintained, better performance"
+      
+      alternative_storage:
+        - name: "database/sql + lib/pq"
+          purpose: "PostgreSQL option"
+          rationale: "More deployment options"
+        - name: "go-sqlite3"
+          purpose: "Embedded database"
+          rationale: "Zero configuration"
+    
+    security:
+      - name: "golang.org/x/crypto"
+        version: "0.23.0"
+        purpose: "Cryptography"
+        rationale: "Latest security patches"
+    
+    utilities:
+      - name: "zerolog"
+        version: "1.32.0"
+        purpose: "Structured logging"
+        rationale: "High performance, zero allocation"
+      - name: "viper"
+        version: "1.18.2"
+        purpose: "Configuration management"
+        rationale: "Industry standard, multiple sources"
+      - name: "nhooyr.io/websocket"
+        version: "1.8.10"
+        purpose: "Modern WebSocket library"
+        rationale: "Better API, context support"
+    
+    testing:
+      - name: "testify"
+        version: "1.8.4"
+        purpose: "Testing toolkit"
+        rationale: "Rich assertions, mocking"
+      - name: "ginkgo"
+        version: "2.15.0"
+        purpose: "BDD testing"
+        rationale: "Expressive test structure"
+  
+  build_tools:
+    - name: "Go modules"
+      purpose: "Dependency management"
+      rationale: "Native Go solution"
+    - name: "Taskfile"
+      version: "3.33.1"
+      purpose: "Modern task runner"
+      rationale: "Cross-platform, YAML-based"
+    - name: "golangci-lint"
+      version: "1.55.2"
+      purpose: "Linting"
+      rationale: "Comprehensive code quality"
+  
+  deployment:
+    - name: "Docker"
+      base_image: "distroless/static"
+      multi_stage: true
+      rationale: "Minimal attack surface"
+    - name: "Kubernetes"
+      manifests: "Helm charts"
+      rationale: "Cloud-native deployment"
+    - name: "GitHub Releases"
+      assets: "Pre-built binaries"
+      rationale: "Easy distribution"
+
+migration_strategy:
+  phase_1_security: # Week 1
+    - update: "golang.org/x/crypto"
+    - update: "gorilla/websocket"
+    - migrate: "vendor → go.mod"
+    - add: "security scanning"
+  
+  phase_2_core: # Week 2-3
+    - replace: "mgo.v2 → mongo-driver"
+    - update: "all gorilla packages"
+    - replace: "ian-kent packages"
+    - add: "structured logging"
+  
+  phase_3_enhancement: # Week 4
+    - add: "OpenTelemetry"
+    - add: "Prometheus metrics"
+    - improve: "error handling"
+    - add: "context propagation"
+
+development_tools:
+  ide:
+    - name: "VS Code"
+      extensions:
+        - "golang.go"
+        - "EditorConfig"
+        - "GitLens"
+    - name: "GoLand"
+      purpose: "Full IDE support"
+  
+  debugging:
+    - name: "Delve"
+      version: "1.22.0"
+      purpose: "Go debugger"
+    - name: "pprof"
+      purpose: "Performance profiling"
+  
+  quality:
+    - name: "pre-commit"
+      hooks:
+        - "gofmt"
+        - "golangci-lint"
+        - "go test"
+    - name: "SonarQube"
+      purpose: "Code quality metrics"
+
+performance_targets:
+  build_time: "<30 seconds"
+  binary_size: "<20MB"
+  startup_time: "<100ms"
+  memory_baseline: "<50MB"
+  
+benchmarks:
+  smtp_throughput: "10,000 messages/minute"
+  api_latency_p50: "<10ms"
+  api_latency_p99: "<50ms"
+  concurrent_connections: "10,000"
+
+compatibility_matrix:
+  go_versions:
+    minimum: "1.19"
+    recommended: "1.21"
+    tested: ["1.19", "1.20", "1.21"]
+  
+  platforms:
+    linux:
+      - "amd64"
+      - "arm64"
+      - "arm/v7"
+    darwin:
+      - "amd64"
+      - "arm64"
+    windows:
+      - "amd64"
+    
+  databases:
+    mongodb:
+      minimum: "4.4"
+      recommended: "7.0"
+    postgresql:
+      minimum: "12"
+      recommended: "15"

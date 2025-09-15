@@ -1,0 +1,1123 @@
+name: 📋 Fortress Compliance Validation Pipeline
+
+on:
+  push:
+    branches: [main, develop, release/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run compliance checks weekly on Mondays at 6 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      compliance_standard:
+        description: 'Compliance standard to validate'
+        required: true
+        type: choice
+        options:
+          - all
+          - owasp
+          - gdpr
+          - sox
+          - pci-dss
+          - hipaa
+          - iso27001
+        default: 'all'
+      severity_level:
+        description: 'Minimum compliance severity level'
+        required: false
+        type: choice
+        options:
+          - critical
+          - high
+          - medium
+          - low
+        default: 'high'
+
+env:
+  NODE_VERSION: '18'
+  GO_VERSION: '1.21'
+  
+  # Compliance thresholds
+  MIN_COMPLIANCE_SCORE: 85
+  MAX_CRITICAL_VIOLATIONS: 0
+  MAX_HIGH_VIOLATIONS: 0
+  MAX_MEDIUM_VIOLATIONS: 3
+  
+  # Compliance standards configuration
+  OWASP_TOP_10_VERSION: '2021'
+  GDPR_VALIDATION: 'enabled'
+  SOX_VALIDATION: 'enabled'
+  PCI_DSS_VERSION: '4.0'
+  HIPAA_VALIDATION: 'enabled'
+  ISO27001_VERSION: '2022'
+
+jobs:
+  # ===== COMPLIANCE SETUP AND VALIDATION =====
+  compliance-setup:
+    name: 📋 Compliance Setup & Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    outputs:
+      compliance-config: ${{ steps.config.outputs.config }}
+      standards-to-check: ${{ steps.config.outputs.standards }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 📋 Configure Compliance Standards
+        id: config
+        run: |
+          # Determine which compliance standards to validate
+          case "${{ inputs.compliance_standard }}" in
+            "owasp")
+              STANDARDS='["OWASP"]'
+              ;;
+            "gdpr")
+              STANDARDS='["GDPR"]'
+              ;;
+            "sox")
+              STANDARDS='["SOX"]'
+              ;;
+            "pci-dss")
+              STANDARDS='["PCI-DSS"]'
+              ;;
+            "hipaa")
+              STANDARDS='["HIPAA"]'
+              ;;
+            "iso27001")
+              STANDARDS='["ISO27001"]'
+              ;;
+            *)
+              STANDARDS='["OWASP", "GDPR", "SOX", "PCI-DSS", "HIPAA", "ISO27001"]'
+              ;;
+          esac
+          
+          cat > compliance-config.json << EOF
+          {
+            "standards_to_check": $STANDARDS,
+            "severity_threshold": "${{ inputs.severity_level }}",
+            "thresholds": {
+              "min_compliance_score": ${{ env.MIN_COMPLIANCE_SCORE }},
+              "max_critical_violations": ${{ env.MAX_CRITICAL_VIOLATIONS }},
+              "max_high_violations": ${{ env.MAX_HIGH_VIOLATIONS }},
+              "max_medium_violations": ${{ env.MAX_MEDIUM_VIOLATIONS }}
+            }
+          }
+          EOF
+          
+          echo "config=$(cat compliance-config.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          echo "standards=$STANDARDS" >> $GITHUB_OUTPUT
+          
+      - name: 🔍 Validate Repository Structure
+        run: |
+          echo "🔍 Validating repository structure for compliance..."
+          
+          STRUCTURE_ISSUES=()
+          
+          # Check for required compliance files
+          if [ ! -f "SECURITY.md" ]; then
+            STRUCTURE_ISSUES+=("Missing SECURITY.md file (required for vulnerability disclosure)")
+          fi
+          
+          if [ ! -f "PRIVACY.md" ]; then
+            STRUCTURE_ISSUES+=("Missing PRIVACY.md file (required for GDPR compliance)")
+          fi
+          
+          if [ ! -f "LICENSE" ] && [ ! -f "LICENSE.md" ]; then
+            STRUCTURE_ISSUES+=("Missing LICENSE file (required for legal compliance)")
+          fi
+          
+          if [ ! -d ".github/ISSUE_TEMPLATE" ]; then
+            STRUCTURE_ISSUES+=("Missing issue templates (recommended for compliance tracking)")
+          fi
+          
+          if [ ! -f "CHANGELOG.md" ]; then
+            STRUCTURE_ISSUES+=("Missing CHANGELOG.md file (required for SOX compliance)")
+          fi
+          
+          # Check for compliance documentation
+          if [ ! -d "docs/compliance" ]; then
+            STRUCTURE_ISSUES+=("Missing compliance documentation directory")
+          fi
+          
+          # Generate structure report
+          printf '%s\n' "${STRUCTURE_ISSUES[@]}" | jq -R . | jq -s . > repository-structure-issues.json
+          
+          if [ ${#STRUCTURE_ISSUES[@]} -gt 0 ]; then
+            echo "⚠️  Repository structure issues found:"
+            printf '%s\n' "${STRUCTURE_ISSUES[@]}"
+          else
+            echo "✅ Repository structure compliant"
+          fi
+          
+      - name: 📤 Upload Compliance Configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-config-${{ github.sha }}
+          path: |
+            compliance-config.json
+            repository-structure-issues.json
+
+  # ===== OWASP TOP 10 COMPLIANCE =====
+  owasp-compliance:
+    name: 🛡️ OWASP Top 10 Compliance
+    runs-on: ubuntu-latest
+    needs: compliance-setup
+    if: contains(needs.compliance-setup.outputs.standards-to-check, 'OWASP')
+    timeout-minutes: 30
+    
+    outputs:
+      owasp-results: ${{ steps.owasp-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📥 Install Dependencies
+        run: |
+          go mod download
+          cd frontend && npm ci --prefer-offline
+          
+      - name: 🛡️ OWASP Top 10 2021 Security Analysis
+        run: |
+          mkdir -p compliance-results/owasp
+          
+          echo "🛡️ Analyzing against OWASP Top 10 2021..."
+          
+          # A01:2021 - Broken Access Control
+          echo "Checking A01: Broken Access Control..."
+          BROKEN_ACCESS_ISSUES=()
+          
+          # Check for proper authentication middleware
+          if ! grep -r "authentication" pkg/ --include="*.go" > /dev/null; then
+            BROKEN_ACCESS_ISSUES+=("Missing authentication middleware")
+          fi
+          
+          # Check for authorization checks
+          if ! grep -r "authorize\|permission" pkg/ --include="*.go" > /dev/null; then
+            BROKEN_ACCESS_ISSUES+=("Missing authorization checks")
+          fi
+          
+          # A02:2021 - Cryptographic Failures
+          echo "Checking A02: Cryptographic Failures..."
+          CRYPTO_ISSUES=()
+          
+          # Check for weak encryption
+          if grep -r "md5\|sha1" . --include="*.go" --include="*.js" > /dev/null; then
+            CRYPTO_ISSUES+=("Weak hashing algorithms detected (MD5/SHA1)")
+          fi
+          
+          # Check for hardcoded secrets
+          if grep -rE "(password|secret|key|token)\s*=\s*['\"][^'\"]{8,}" . --include="*.go" --include="*.js" > /dev/null; then
+            CRYPTO_ISSUES+=("Potential hardcoded secrets detected")
+          fi
+          
+          # A03:2021 - Injection
+          echo "Checking A03: Injection..."
+          INJECTION_ISSUES=()
+          
+          # Check for SQL injection protection
+          if ! grep -r "sqlx\|prepared statement\|parameterized" pkg/ --include="*.go" > /dev/null; then
+            INJECTION_ISSUES+=("Missing parameterized queries for SQL injection protection")
+          fi
+          
+          # Check for command injection
+          if grep -r "exec\.Command\|os\.Exec" pkg/ --include="*.go" > /dev/null; then
+            INJECTION_ISSUES+=("Command execution detected - review for injection risks")
+          fi
+          
+          # A04:2021 - Insecure Design
+          echo "Checking A04: Insecure Design..."
+          DESIGN_ISSUES=()
+          
+          # Check for rate limiting
+          if ! grep -r "rate.limit\|throttl" . --include="*.go" --include="*.js" > /dev/null; then
+            DESIGN_ISSUES+=("Missing rate limiting implementation")
+          fi
+          
+          # A05:2021 - Security Misconfiguration
+          echo "Checking A05: Security Misconfiguration..."
+          MISCONFIG_ISSUES=()
+          
+          # Check for debug mode in production
+          if grep -r "debug.*true\|DEBUG.*true" config/ > /dev/null; then
+            MISCONFIG_ISSUES+=("Debug mode enabled in configuration")
+          fi
+          
+          # Check for default credentials
+          if grep -rE "(admin|root|default):(admin|root|password|default)" . > /dev/null; then
+            MISCONFIG_ISSUES+=("Default credentials detected")
+          fi
+          
+          # A06:2021 - Vulnerable and Outdated Components
+          echo "Checking A06: Vulnerable and Outdated Components..."
+          COMPONENT_ISSUES=()
+          
+          # This would be handled by dependency scanning in security pipeline
+          # Just check for presence of security scanning
+          if [ ! -f ".github/workflows/fortress-security.yml" ]; then
+            COMPONENT_ISSUES+=("Missing automated dependency vulnerability scanning")
+          fi
+          
+          # A07:2021 - Identification and Authentication Failures
+          echo "Checking A07: Identification and Authentication Failures..."
+          AUTH_ISSUES=()
+          
+          # Check for session management
+          if ! grep -r "session\|jwt\|token" pkg/ --include="*.go" > /dev/null; then
+            AUTH_ISSUES+=("Missing session management implementation")
+          fi
+          
+          # Check for password complexity requirements
+          if ! grep -r "password.*complexity\|password.*policy" . --include="*.go" --include="*.js" > /dev/null; then
+            AUTH_ISSUES+=("Missing password complexity enforcement")
+          fi
+          
+          # A08:2021 - Software and Data Integrity Failures
+          echo "Checking A08: Software and Data Integrity Failures..."
+          INTEGRITY_ISSUES=()
+          
+          # Check for code signing
+          if [ ! -f ".github/workflows/release.yml" ]; then
+            INTEGRITY_ISSUES+=("Missing release and code signing process")
+          fi
+          
+          # A09:2021 - Security Logging and Monitoring Failures
+          echo "Checking A09: Security Logging and Monitoring Failures..."
+          LOGGING_ISSUES=()
+          
+          # Check for security logging
+          if ! grep -r "security.*log\|audit.*log" pkg/ --include="*.go" > /dev/null; then
+            LOGGING_ISSUES+=("Missing security event logging")
+          fi
+          
+          # Check for monitoring setup
+          if [ ! -f "config/monitoring.yml" ] && [ ! -f "docker-compose.monitoring.yml" ]; then
+            LOGGING_ISSUES+=("Missing security monitoring configuration")
+          fi
+          
+          # A10:2021 - Server-Side Request Forgery (SSRF)
+          echo "Checking A10: Server-Side Request Forgery..."
+          SSRF_ISSUES=()
+          
+          # Check for URL validation
+          if grep -r "http\.Get\|http\.Post" pkg/ --include="*.go" > /dev/null && ! grep -r "url.*validation\|whitelist" pkg/ --include="*.go" > /dev/null; then
+            SSRF_ISSUES+=("HTTP requests without URL validation detected")
+          fi
+          
+          # Generate OWASP compliance report
+          cat > compliance-results/owasp/owasp-analysis.json << EOF
+          {
+            "standard": "OWASP Top 10 2021",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "categories": {
+              "A01_Broken_Access_Control": {
+                "issues": $(printf '%s\n' "${BROKEN_ACCESS_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#BROKEN_ACCESS_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A02_Cryptographic_Failures": {
+                "issues": $(printf '%s\n' "${CRYPTO_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "critical",
+                "compliant": $([ ${#CRYPTO_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A03_Injection": {
+                "issues": $(printf '%s\n' "${INJECTION_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "critical",
+                "compliant": $([ ${#INJECTION_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A04_Insecure_Design": {
+                "issues": $(printf '%s\n' "${DESIGN_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#DESIGN_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A05_Security_Misconfiguration": {
+                "issues": $(printf '%s\n' "${MISCONFIG_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#MISCONFIG_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A06_Vulnerable_Components": {
+                "issues": $(printf '%s\n' "${COMPONENT_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#COMPONENT_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A07_Auth_Failures": {
+                "issues": $(printf '%s\n' "${AUTH_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#AUTH_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A08_Integrity_Failures": {
+                "issues": $(printf '%s\n' "${INTEGRITY_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "medium",
+                "compliant": $([ ${#INTEGRITY_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A09_Logging_Monitoring": {
+                "issues": $(printf '%s\n' "${LOGGING_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "medium",
+                "compliant": $([ ${#LOGGING_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              },
+              "A10_SSRF": {
+                "issues": $(printf '%s\n' "${SSRF_ISSUES[@]}" | jq -R . | jq -s .),
+                "severity": "high",
+                "compliant": $([ ${#SSRF_ISSUES[@]} -eq 0 ] && echo "true" || echo "false")
+              }
+            }
+          }
+          EOF
+          
+      - name: 📊 Calculate OWASP Compliance Score
+        id: owasp-results
+        run: |
+          # Calculate compliance score based on issues found
+          TOTAL_CATEGORIES=10
+          COMPLIANT_CATEGORIES=$(jq '[.categories[] | select(.compliant == true)] | length' compliance-results/owasp/owasp-analysis.json)
+          COMPLIANCE_SCORE=$((COMPLIANT_CATEGORIES * 100 / TOTAL_CATEGORIES))
+          
+          echo "OWASP Compliance Score: $COMPLIANCE_SCORE%"
+          
+          # Count violations by severity
+          CRITICAL_VIOLATIONS=$(jq '[.categories[] | select(.severity == "critical" and .compliant == false)] | length' compliance-results/owasp/owasp-analysis.json)
+          HIGH_VIOLATIONS=$(jq '[.categories[] | select(.severity == "high" and .compliant == false)] | length' compliance-results/owasp/owasp-analysis.json)
+          MEDIUM_VIOLATIONS=$(jq '[.categories[] | select(.severity == "medium" and .compliant == false)] | length' compliance-results/owasp/owasp-analysis.json)
+          
+          # Generate summary
+          cat > compliance-results/owasp/owasp-summary.json << EOF
+          {
+            "standard": "OWASP",
+            "compliance_score": $COMPLIANCE_SCORE,
+            "violations": {
+              "critical": $CRITICAL_VIOLATIONS,
+              "high": $HIGH_VIOLATIONS,
+              "medium": $MEDIUM_VIOLATIONS
+            },
+            "passed": $([ $COMPLIANCE_SCORE -ge $MIN_COMPLIANCE_SCORE ] && echo "true" || echo "false")
+          }
+          EOF
+          
+          echo "results=$(cat compliance-results/owasp/owasp-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload OWASP Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-compliance-results-${{ github.sha }}
+          path: compliance-results/owasp/
+
+  # ===== GDPR COMPLIANCE =====
+  gdpr-compliance:
+    name: 🔒 GDPR Compliance Validation
+    runs-on: ubuntu-latest
+    needs: compliance-setup
+    if: contains(needs.compliance-setup.outputs.standards-to-check, 'GDPR')
+    timeout-minutes: 20
+    
+    outputs:
+      gdpr-results: ${{ steps.gdpr-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🔒 GDPR Article Compliance Analysis
+        run: |
+          mkdir -p compliance-results/gdpr
+          
+          echo "🔒 Analyzing GDPR compliance..."
+          
+          GDPR_ISSUES=()
+          
+          # Article 5 - Lawfulness, fairness and transparency
+          echo "Checking Article 5: Data processing principles..."
+          if [ ! -f "PRIVACY.md" ] && [ ! -f "docs/privacy-policy.md" ]; then
+            GDPR_ISSUES+=("Missing privacy policy (Article 5 - Transparency)")
+          fi
+          
+          # Article 6 - Lawful basis for processing
+          echo "Checking Article 6: Lawful basis..."
+          if ! grep -r "consent\|legitimate.interest\|contract" . --include="*.md" --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing lawful basis documentation (Article 6)")
+          fi
+          
+          # Article 7 - Consent
+          echo "Checking Article 7: Consent mechanisms..."
+          if ! grep -r "consent.*withdraw\|opt.out\|unsubscribe" . --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing consent withdrawal mechanism (Article 7)")
+          fi
+          
+          # Article 9 - Special categories of personal data
+          echo "Checking Article 9: Special categories..."
+          if grep -rE "(race|ethnic|political|religious|health|sex|genetic|biometric)" . --include="*.go" --include="*.js" > /dev/null; then
+            if ! grep -r "explicit.consent\|special.category" . --include="*.go" --include="*.js" > /dev/null; then
+              GDPR_ISSUES+=("Special category data without explicit consent (Article 9)")
+            fi
+          fi
+          
+          # Article 12 - Transparent information
+          echo "Checking Article 12: Transparent information..."
+          if [ ! -f "docs/data-processing-info.md" ]; then
+            GDPR_ISSUES+=("Missing transparent data processing information (Article 12)")
+          fi
+          
+          # Article 15 - Right of access
+          echo "Checking Article 15: Right of access..."
+          if ! grep -r "data.export\|user.data\|access.request" . --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing data access functionality (Article 15)")
+          fi
+          
+          # Article 16 - Right to rectification
+          echo "Checking Article 16: Right to rectification..."
+          if ! grep -r "update.*profile\|edit.*data\|rectification" . --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing data rectification functionality (Article 16)")
+          fi
+          
+          # Article 17 - Right to erasure (Right to be forgotten)
+          echo "Checking Article 17: Right to erasure..."
+          if ! grep -r "delete.*account\|erasure\|forgot.*me" . --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing data erasure functionality (Article 17)")
+          fi
+          
+          # Article 20 - Right to data portability
+          echo "Checking Article 20: Data portability..."
+          if ! grep -r "export.*data\|portability\|download.*data" . --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing data portability functionality (Article 20)")
+          fi
+          
+          # Article 25 - Data protection by design and by default
+          echo "Checking Article 25: Privacy by design..."
+          if ! grep -r "privacy.*design\|default.*privacy" . --include="*.go" --include="*.js" --include="*.md" > /dev/null; then
+            GDPR_ISSUES+=("Missing privacy by design implementation (Article 25)")
+          fi
+          
+          # Article 30 - Records of processing activities
+          echo "Checking Article 30: Processing records..."
+          if [ ! -f "docs/data-processing-records.md" ]; then
+            GDPR_ISSUES+=("Missing records of processing activities (Article 30)")
+          fi
+          
+          # Article 32 - Security of processing
+          echo "Checking Article 32: Security measures..."
+          SECURITY_MEASURES=0
+          if grep -r "encrypt\|tls\|https" . --include="*.go" --include="*.js" > /dev/null; then
+            SECURITY_MEASURES=$((SECURITY_MEASURES + 1))
+          fi
+          if grep -r "hash\|bcrypt\|argon2" . --include="*.go" > /dev/null; then
+            SECURITY_MEASURES=$((SECURITY_MEASURES + 1))
+          fi
+          if [ -f ".github/workflows/fortress-security.yml" ]; then
+            SECURITY_MEASURES=$((SECURITY_MEASURES + 1))
+          fi
+          
+          if [ $SECURITY_MEASURES -lt 2 ]; then
+            GDPR_ISSUES+=("Insufficient security measures (Article 32)")
+          fi
+          
+          # Article 33 - Data breach notification
+          echo "Checking Article 33: Breach notification..."
+          if ! grep -r "breach.*notification\|incident.*response" . --include="*.md" --include="*.go" --include="*.js" > /dev/null; then
+            GDPR_ISSUES+=("Missing breach notification procedure (Article 33)")
+          fi
+          
+          # Article 35 - Data Protection Impact Assessment (DPIA)
+          echo "Checking Article 35: DPIA requirement..."
+          if [ ! -f "docs/dpia.md" ] && [ ! -f "docs/privacy-impact-assessment.md" ]; then
+            GDPR_ISSUES+=("Missing Data Protection Impact Assessment (Article 35)")
+          fi
+          
+          # Generate GDPR compliance report
+          cat > compliance-results/gdpr/gdpr-analysis.json << EOF
+          {
+            "standard": "GDPR",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "issues": $(printf '%s\n' "${GDPR_ISSUES[@]}" | jq -R . | jq -s .),
+            "total_issues": ${#GDPR_ISSUES[@]},
+            "articles_checked": [
+              "Article 5", "Article 6", "Article 7", "Article 9", "Article 12",
+              "Article 15", "Article 16", "Article 17", "Article 20", "Article 25",
+              "Article 30", "Article 32", "Article 33", "Article 35"
+            ]
+          }
+          EOF
+          
+      - name: 📊 Calculate GDPR Compliance Score
+        id: gdpr-results
+        run: |
+          TOTAL_ISSUES=$(jq '.total_issues' compliance-results/gdpr/gdpr-analysis.json)
+          TOTAL_ARTICLES=14
+          
+          # Calculate score (100 - percentage of failed articles)
+          COMPLIANCE_SCORE=$((100 - (TOTAL_ISSUES * 100 / TOTAL_ARTICLES)))
+          if [ $COMPLIANCE_SCORE -lt 0 ]; then
+            COMPLIANCE_SCORE=0
+          fi
+          
+          echo "GDPR Compliance Score: $COMPLIANCE_SCORE%"
+          
+          # Generate summary
+          cat > compliance-results/gdpr/gdpr-summary.json << EOF
+          {
+            "standard": "GDPR",
+            "compliance_score": $COMPLIANCE_SCORE,
+            "violations": {
+              "critical": $TOTAL_ISSUES,
+              "high": 0,
+              "medium": 0
+            },
+            "passed": $([ $COMPLIANCE_SCORE -ge $MIN_COMPLIANCE_SCORE ] && echo "true" || echo "false")
+          }
+          EOF
+          
+          echo "results=$(cat compliance-results/gdpr/gdpr-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload GDPR Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdpr-compliance-results-${{ github.sha }}
+          path: compliance-results/gdpr/
+
+  # ===== SOX COMPLIANCE =====
+  sox-compliance:
+    name: 📊 SOX Compliance Validation
+    runs-on: ubuntu-latest
+    needs: compliance-setup
+    if: contains(needs.compliance-setup.outputs.standards-to-check, 'SOX')
+    timeout-minutes: 15
+    
+    outputs:
+      sox-results: ${{ steps.sox-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 📊 SOX Section 404 Controls Analysis
+        run: |
+          mkdir -p compliance-results/sox
+          
+          echo "📊 Analyzing SOX compliance..."
+          
+          SOX_ISSUES=()
+          
+          # Section 404 - Internal Controls
+          echo "Checking Section 404: Internal controls over financial reporting..."
+          
+          # Change management controls
+          if [ ! -f "CHANGELOG.md" ]; then
+            SOX_ISSUES+=("Missing change log documentation (SOX 404 - Change Management)")
+          fi
+          
+          # Code review controls
+          if [ ! -f ".github/CODEOWNERS" ]; then
+            SOX_ISSUES+=("Missing code ownership controls (SOX 404 - Review Controls)")
+          fi
+          
+          # Branch protection
+          if [ ! -f ".github/branch-protection-rules.md" ]; then
+            SOX_ISSUES+=("Missing branch protection documentation (SOX 404 - Access Controls)")
+          fi
+          
+          # Audit trail
+          if ! grep -r "audit.*log\|audit.*trail" . --include="*.go" --include="*.js" --include="*.md" > /dev/null; then
+            SOX_ISSUES+=("Missing audit trail implementation (SOX 404 - Monitoring Controls)")
+          fi
+          
+          # Segregation of duties
+          if [ ! -f ".github/workflows/fortress-cd.yml" ]; then
+            SOX_ISSUES+=("Missing automated deployment controls (SOX 404 - Segregation of Duties)")
+          fi
+          
+          # Data backup and recovery
+          if [ ! -f "docs/backup-recovery-plan.md" ]; then
+            SOX_ISSUES+=("Missing backup and recovery procedures (SOX 404 - IT General Controls)")
+          fi
+          
+          # Access controls
+          if ! grep -r "authentication\|authorization" pkg/ --include="*.go" > /dev/null; then
+            SOX_ISSUES+=("Missing access control implementation (SOX 404 - Access Controls)")
+          fi
+          
+          # Financial data controls (if applicable)
+          if grep -rE "(revenue|payment|invoice|transaction|financial)" . --include="*.go" --include="*.js" > /dev/null; then
+            if ! grep -r "financial.*control\|transaction.*log" . --include="*.go" --include="*.js" > /dev/null; then
+              SOX_ISSUES+=("Missing financial data controls (SOX 404 - Financial Reporting Controls)")
+            fi
+          fi
+          
+          # Testing and validation
+          if [ ! -f ".github/workflows/fortress-testing.yml" ] && [ ! -f ".github/workflows/fortress-ci.yml" ]; then
+            SOX_ISSUES+=("Missing automated testing controls (SOX 404 - Testing Controls)")
+          fi
+          
+          # Documentation controls
+          if [ ! -d "docs/" ]; then
+            SOX_ISSUES+=("Missing documentation repository (SOX 404 - Documentation Controls)")
+          fi
+          
+          # Generate SOX compliance report
+          cat > compliance-results/sox/sox-analysis.json << EOF
+          {
+            "standard": "SOX Section 404",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "issues": $(printf '%s\n' "${SOX_ISSUES[@]}" | jq -R . | jq -s .),
+            "total_issues": ${#SOX_ISSUES[@]},
+            "controls_checked": [
+              "Change Management", "Code Review", "Branch Protection", "Audit Trail",
+              "Segregation of Duties", "Backup Recovery", "Access Controls",
+              "Financial Data Controls", "Testing Controls", "Documentation Controls"
+            ]
+          }
+          EOF
+          
+      - name: 📊 Calculate SOX Compliance Score
+        id: sox-results
+        run: |
+          TOTAL_ISSUES=$(jq '.total_issues' compliance-results/sox/sox-analysis.json)
+          TOTAL_CONTROLS=10
+          
+          # Calculate score
+          COMPLIANCE_SCORE=$((100 - (TOTAL_ISSUES * 100 / TOTAL_CONTROLS)))
+          if [ $COMPLIANCE_SCORE -lt 0 ]; then
+            COMPLIANCE_SCORE=0
+          fi
+          
+          echo "SOX Compliance Score: $COMPLIANCE_SCORE%"
+          
+          # Generate summary
+          cat > compliance-results/sox/sox-summary.json << EOF
+          {
+            "standard": "SOX",
+            "compliance_score": $COMPLIANCE_SCORE,
+            "violations": {
+              "critical": 0,
+              "high": $TOTAL_ISSUES,
+              "medium": 0
+            },
+            "passed": $([ $COMPLIANCE_SCORE -ge $MIN_COMPLIANCE_SCORE ] && echo "true" || echo "false")
+          }
+          EOF
+          
+          echo "results=$(cat compliance-results/sox/sox-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload SOX Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sox-compliance-results-${{ github.sha }}
+          path: compliance-results/sox/
+
+  # ===== PCI DSS COMPLIANCE =====
+  pci-dss-compliance:
+    name: 💳 PCI DSS Compliance Validation
+    runs-on: ubuntu-latest
+    needs: compliance-setup
+    if: contains(needs.compliance-setup.outputs.standards-to-check, 'PCI-DSS')
+    timeout-minutes: 20
+    
+    outputs:
+      pci-dss-results: ${{ steps.pci-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 💳 PCI DSS Requirements Analysis
+        run: |
+          mkdir -p compliance-results/pci-dss
+          
+          echo "💳 Analyzing PCI DSS compliance..."
+          
+          PCI_ISSUES=()
+          
+          # Requirement 1: Install and maintain a firewall
+          echo "Checking Requirement 1: Firewall configuration..."
+          if [ ! -f "terraform/security-groups.tf" ] && [ ! -f "k8s/network-policies/" ]; then
+            PCI_ISSUES+=("Missing firewall/network security configuration (Req 1)")
+          fi
+          
+          # Requirement 2: Do not use vendor-supplied defaults
+          echo "Checking Requirement 2: Default passwords and security parameters..."
+          if grep -rE "(admin|root):(admin|root|password|default)" . > /dev/null; then
+            PCI_ISSUES+=("Default credentials detected (Req 2)")
+          fi
+          
+          # Requirement 3: Protect stored cardholder data
+          echo "Checking Requirement 3: Cardholder data protection..."
+          if grep -rE "(card.*number|ccn|pan|credit.*card)" . --include="*.go" --include="*.js" > /dev/null; then
+            if ! grep -r "encrypt\|tokeniz" . --include="*.go" --include="*.js" > /dev/null; then
+              PCI_ISSUES+=("Cardholder data without encryption/tokenization (Req 3)")
+            fi
+          fi
+          
+          # Requirement 4: Encrypt transmission of cardholder data
+          echo "Checking Requirement 4: Data transmission encryption..."
+          if ! grep -r "tls\|ssl\|https" . --include="*.go" --include="*.js" --include="*.yaml" > /dev/null; then
+            PCI_ISSUES+=("Missing encryption for data transmission (Req 4)")
+          fi
+          
+          # Requirement 5: Protect all systems against malware
+          echo "Checking Requirement 5: Anti-malware protection..."
+          if [ ! -f ".github/workflows/fortress-security.yml" ]; then
+            PCI_ISSUES+=("Missing automated security scanning (Req 5)")
+          fi
+          
+          # Requirement 6: Develop and maintain secure systems
+          echo "Checking Requirement 6: Secure development practices..."
+          SECURE_DEV_SCORE=0
+          if [ -f ".github/workflows/fortress-ci.yml" ]; then
+            SECURE_DEV_SCORE=$((SECURE_DEV_SCORE + 1))
+          fi
+          if grep -r "code.*review\|pull.*request" .github/ > /dev/null; then
+            SECURE_DEV_SCORE=$((SECURE_DEV_SCORE + 1))
+          fi
+          if [ -f ".github/workflows/fortress-security.yml" ]; then
+            SECURE_DEV_SCORE=$((SECURE_DEV_SCORE + 1))
+          fi
+          
+          if [ $SECURE_DEV_SCORE -lt 2 ]; then
+            PCI_ISSUES+=("Insufficient secure development practices (Req 6)")
+          fi
+          
+          # Requirement 7: Restrict access by business need-to-know
+          echo "Checking Requirement 7: Access restriction..."
+          if ! grep -r "role.*based\|rbac\|authorization" . --include="*.go" --include="*.js" > /dev/null; then
+            PCI_ISSUES+=("Missing role-based access control (Req 7)")
+          fi
+          
+          # Requirement 8: Identify and authenticate access
+          echo "Checking Requirement 8: User identification and authentication..."
+          if ! grep -r "authentication\|login\|password" pkg/ --include="*.go" > /dev/null; then
+            PCI_ISSUES+=("Missing authentication mechanisms (Req 8)")
+          fi
+          
+          # Requirement 9: Restrict physical access (not applicable for software)
+          echo "Requirement 9: Physical access (N/A for software)"
+          
+          # Requirement 10: Track and monitor access
+          echo "Checking Requirement 10: Access logging and monitoring..."
+          if ! grep -r "audit.*log\|access.*log\|monitoring" . --include="*.go" --include="*.js" > /dev/null; then
+            PCI_ISSUES+=("Missing access logging and monitoring (Req 10)")
+          fi
+          
+          # Requirement 11: Regularly test security systems
+          echo "Checking Requirement 11: Security testing..."
+          if [ ! -f ".github/workflows/fortress-security.yml" ]; then
+            PCI_ISSUES+=("Missing regular security testing (Req 11)")
+          fi
+          
+          # Requirement 12: Maintain information security policy
+          echo "Checking Requirement 12: Security policy..."
+          if [ ! -f "SECURITY.md" ] && [ ! -f "docs/security-policy.md" ]; then
+            PCI_ISSUES+=("Missing information security policy (Req 12)")
+          fi
+          
+          # Generate PCI DSS compliance report
+          cat > compliance-results/pci-dss/pci-dss-analysis.json << EOF
+          {
+            "standard": "PCI DSS v4.0",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "issues": $(printf '%s\n' "${PCI_ISSUES[@]}" | jq -R . | jq -s .),
+            "total_issues": ${#PCI_ISSUES[@]},
+            "requirements_checked": [
+              "Req 1: Firewall", "Req 2: Defaults", "Req 3: Data Protection",
+              "Req 4: Transmission", "Req 5: Anti-malware", "Req 6: Secure Development",
+              "Req 7: Access Control", "Req 8: Authentication", "Req 10: Monitoring",
+              "Req 11: Testing", "Req 12: Policy"
+            ]
+          }
+          EOF
+          
+      - name: 📊 Calculate PCI DSS Compliance Score
+        id: pci-results
+        run: |
+          TOTAL_ISSUES=$(jq '.total_issues' compliance-results/pci-dss/pci-dss-analysis.json)
+          TOTAL_REQUIREMENTS=11  # Req 9 not applicable
+          
+          # Calculate score
+          COMPLIANCE_SCORE=$((100 - (TOTAL_ISSUES * 100 / TOTAL_REQUIREMENTS)))
+          if [ $COMPLIANCE_SCORE -lt 0 ]; then
+            COMPLIANCE_SCORE=0
+          fi
+          
+          echo "PCI DSS Compliance Score: $COMPLIANCE_SCORE%"
+          
+          # Generate summary
+          cat > compliance-results/pci-dss/pci-dss-summary.json << EOF
+          {
+            "standard": "PCI-DSS",
+            "compliance_score": $COMPLIANCE_SCORE,
+            "violations": {
+              "critical": $TOTAL_ISSUES,
+              "high": 0,
+              "medium": 0
+            },
+            "passed": $([ $COMPLIANCE_SCORE -ge $MIN_COMPLIANCE_SCORE ] && echo "true" || echo "false")
+          }
+          EOF
+          
+          echo "results=$(cat compliance-results/pci-dss/pci-dss-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload PCI DSS Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pci-dss-compliance-results-${{ github.sha }}
+          path: compliance-results/pci-dss/
+
+  # ===== COMPLIANCE QUALITY GATE =====
+  compliance-quality-gate:
+    name: 📋 Compliance Quality Gate
+    runs-on: ubuntu-latest
+    needs: [compliance-setup, owasp-compliance, gdpr-compliance, sox-compliance, pci-dss-compliance]
+    if: always()
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Download All Compliance Reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-compliance-results-${{ github.sha }}'
+          merge-multiple: true
+          
+      - name: 📥 Download Configuration
+        uses: actions/download-artifact@v4
+        with:
+          name: compliance-config-${{ github.sha }}
+          
+      - name: 📊 Aggregate Compliance Results
+        run: |
+          echo "📊 Aggregating all compliance results..."
+          
+          mkdir -p final-compliance-reports
+          
+          # Initialize compliance summary
+          cat > final-compliance-reports/compliance-summary.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit_sha": "${{ github.sha }}",
+            "standards_checked": $(cat compliance-config.json | jq '.standards_to_check'),
+            "results": {},
+            "overall_score": 0,
+            "quality_gate": {
+              "passed": false,
+              "failed_standards": []
+            }
+          }
+          EOF
+          
+          # Aggregate results from each standard
+          TOTAL_SCORE=0
+          STANDARDS_COUNT=0
+          FAILED_STANDARDS=()
+          
+          # Process OWASP results
+          if [ -f "compliance-results/owasp/owasp-summary.json" ]; then
+            OWASP_SCORE=$(jq '.compliance_score' compliance-results/owasp/owasp-summary.json)
+            OWASP_PASSED=$(jq '.passed' compliance-results/owasp/owasp-summary.json)
+            
+            jq --argjson owasp "$(cat compliance-results/owasp/owasp-summary.json)" \
+               '.results.OWASP = $owasp' final-compliance-reports/compliance-summary.json > temp.json
+            mv temp.json final-compliance-reports/compliance-summary.json
+            
+            TOTAL_SCORE=$((TOTAL_SCORE + OWASP_SCORE))
+            STANDARDS_COUNT=$((STANDARDS_COUNT + 1))
+            
+            if [ "$OWASP_PASSED" = "false" ]; then
+              FAILED_STANDARDS+=("OWASP Top 10")
+            fi
+          fi
+          
+          # Process GDPR results
+          if [ -f "compliance-results/gdpr/gdpr-summary.json" ]; then
+            GDPR_SCORE=$(jq '.compliance_score' compliance-results/gdpr/gdpr-summary.json)
+            GDPR_PASSED=$(jq '.passed' compliance-results/gdpr/gdpr-summary.json)
+            
+            jq --argjson gdpr "$(cat compliance-results/gdpr/gdpr-summary.json)" \
+               '.results.GDPR = $gdpr' final-compliance-reports/compliance-summary.json > temp.json
+            mv temp.json final-compliance-reports/compliance-summary.json
+            
+            TOTAL_SCORE=$((TOTAL_SCORE + GDPR_SCORE))
+            STANDARDS_COUNT=$((STANDARDS_COUNT + 1))
+            
+            if [ "$GDPR_PASSED" = "false" ]; then
+              FAILED_STANDARDS+=("GDPR")
+            fi
+          fi
+          
+          # Process SOX results
+          if [ -f "compliance-results/sox/sox-summary.json" ]; then
+            SOX_SCORE=$(jq '.compliance_score' compliance-results/sox/sox-summary.json)
+            SOX_PASSED=$(jq '.passed' compliance-results/sox/sox-summary.json)
+            
+            jq --argjson sox "$(cat compliance-results/sox/sox-summary.json)" \
+               '.results.SOX = $sox' final-compliance-reports/compliance-summary.json > temp.json
+            mv temp.json final-compliance-reports/compliance-summary.json
+            
+            TOTAL_SCORE=$((TOTAL_SCORE + SOX_SCORE))
+            STANDARDS_COUNT=$((STANDARDS_COUNT + 1))
+            
+            if [ "$SOX_PASSED" = "false" ]; then
+              FAILED_STANDARDS+=("SOX Section 404")
+            fi
+          fi
+          
+          # Process PCI DSS results
+          if [ -f "compliance-results/pci-dss/pci-dss-summary.json" ]; then
+            PCI_SCORE=$(jq '.compliance_score' compliance-results/pci-dss/pci-dss-summary.json)
+            PCI_PASSED=$(jq '.passed' compliance-results/pci-dss/pci-dss-summary.json)
+            
+            jq --argjson pci "$(cat compliance-results/pci-dss/pci-dss-summary.json)" \
+               '.results.PCI_DSS = $pci' final-compliance-reports/compliance-summary.json > temp.json
+            mv temp.json final-compliance-reports/compliance-summary.json
+            
+            TOTAL_SCORE=$((TOTAL_SCORE + PCI_SCORE))
+            STANDARDS_COUNT=$((STANDARDS_COUNT + 1))
+            
+            if [ "$PCI_PASSED" = "false" ]; then
+              FAILED_STANDARDS+=("PCI DSS")
+            fi
+          fi
+          
+          # Calculate overall score
+          if [ $STANDARDS_COUNT -gt 0 ]; then
+            OVERALL_SCORE=$((TOTAL_SCORE / STANDARDS_COUNT))
+          else
+            OVERALL_SCORE=0
+          fi
+          
+          echo "Overall Compliance Score: $OVERALL_SCORE%"
+          echo "Failed Standards: ${#FAILED_STANDARDS[@]}"
+          
+          # Update summary with overall results
+          jq --arg score "$OVERALL_SCORE" \
+             --argjson failed_standards "$(printf '%s\n' "${FAILED_STANDARDS[@]}" | jq -R . | jq -s .)" \
+             '.overall_score = ($score | tonumber) | .quality_gate.failed_standards = $failed_standards' \
+             final-compliance-reports/compliance-summary.json > temp.json
+          mv temp.json final-compliance-reports/compliance-summary.json
+          
+          echo "OVERALL_SCORE=$OVERALL_SCORE" >> $GITHUB_ENV
+          echo "FAILED_STANDARDS_COUNT=${#FAILED_STANDARDS[@]}" >> $GITHUB_ENV
+          
+      - name: 🎯 Compliance Quality Gate Validation
+        run: |
+          echo "🎯 Validating compliance quality gates..."
+          
+          # Check overall compliance score
+          if [ "$OVERALL_SCORE" -ge "$MIN_COMPLIANCE_SCORE" ] && [ "$FAILED_STANDARDS_COUNT" -eq 0 ]; then
+            echo "✅ ALL COMPLIANCE QUALITY GATES PASSED"
+            echo "The build meets all fortress-grade compliance requirements."
+            GATE_STATUS="passed"
+            echo "COMPLIANCE_GATE_STATUS=PASSED" >> $GITHUB_ENV
+          else
+            echo "❌ COMPLIANCE QUALITY GATES FAILED"
+            echo "Overall compliance score: $OVERALL_SCORE% (required: $MIN_COMPLIANCE_SCORE%)"
+            echo "Failed standards: $FAILED_STANDARDS_COUNT"
+            GATE_STATUS="failed"
+            echo "COMPLIANCE_GATE_STATUS=FAILED" >> $GITHUB_ENV
+          fi
+          
+          # Update quality gate status
+          jq --arg status "$GATE_STATUS" \
+             '.quality_gate.passed = ($status == "passed")' \
+             final-compliance-reports/compliance-summary.json > temp.json
+          mv temp.json final-compliance-reports/compliance-summary.json
+          
+      - name: 📊 Generate Compliance Dashboard
+        run: |
+          cat > final-compliance-reports/compliance-dashboard.md << EOF
+          # 📋 Fortress Compliance Dashboard
+          
+          ## 📊 Compliance Summary
+          
+          **Assessment Date**: $(date -u +%Y-%m-%d\ %H:%M:%S)\ UTC  
+          **Commit SHA**: \`${{ github.sha }}\`  
+          **Overall Compliance Score**: $OVERALL_SCORE%  
+          **Quality Gate Status**: ${{ env.COMPLIANCE_GATE_STATUS == 'PASSED' && '✅ PASSED' || '❌ FAILED' }}
+          
+          ### Standards Compliance
+          
+          EOF
+          
+          # Add compliance results for each standard
+          if [ -f "compliance-results/owasp/owasp-summary.json" ]; then
+            OWASP_SCORE=$(jq '.compliance_score' compliance-results/owasp/owasp-summary.json)
+            OWASP_STATUS=$(jq -r '.passed' compliance-results/owasp/owasp-summary.json)
+            echo "| OWASP Top 10 | ${OWASP_SCORE}% | $([ "$OWASP_STATUS" = "true" ] && echo "✅" || echo "❌") |" >> final-compliance-reports/compliance-dashboard.md
+          fi
+          
+          if [ -f "compliance-results/gdpr/gdpr-summary.json" ]; then
+            GDPR_SCORE=$(jq '.compliance_score' compliance-results/gdpr/gdpr-summary.json)
+            GDPR_STATUS=$(jq -r '.passed' compliance-results/gdpr/gdpr-summary.json)
+            echo "| GDPR | ${GDPR_SCORE}% | $([ "$GDPR_STATUS" = "true" ] && echo "✅" || echo "❌") |" >> final-compliance-reports/compliance-dashboard.md
+          fi
+          
+          if [ -f "compliance-results/sox/sox-summary.json" ]; then
+            SOX_SCORE=$(jq '.compliance_score' compliance-results/sox/sox-summary.json)
+            SOX_STATUS=$(jq -r '.passed' compliance-results/sox/sox-summary.json)
+            echo "| SOX Section 404 | ${SOX_SCORE}% | $([ "$SOX_STATUS" = "true" ] && echo "✅" || echo "❌") |" >> final-compliance-reports/compliance-dashboard.md
+          fi
+          
+          if [ -f "compliance-results/pci-dss/pci-dss-summary.json" ]; then
+            PCI_SCORE=$(jq '.compliance_score' compliance-results/pci-dss/pci-dss-summary.json)
+            PCI_STATUS=$(jq -r '.passed' compliance-results/pci-dss/pci-dss-summary.json)
+            echo "| PCI DSS v4.0 | ${PCI_SCORE}% | $([ "$PCI_STATUS" = "true" ] && echo "✅" || echo "❌") |" >> final-compliance-reports/compliance-dashboard.md
+          fi
+          
+          cat >> final-compliance-reports/compliance-dashboard.md << EOF
+          
+          ### Quality Gate Thresholds
+          
+          - **Minimum Compliance Score**: $MIN_COMPLIANCE_SCORE%
+          - **Maximum Critical Violations**: $MAX_CRITICAL_VIOLATIONS
+          - **Maximum High Violations**: $MAX_HIGH_VIOLATIONS
+          - **Maximum Medium Violations**: $MAX_MEDIUM_VIOLATIONS
+          
+          $([ "${{ env.COMPLIANCE_GATE_STATUS }}" = "PASSED" ] && echo "## ✅ Compliance Quality Gates Passed
+          
+          All compliance quality gates have been successfully validated. The application meets fortress-grade regulatory and security compliance standards." || echo "## ❌ Compliance Quality Gates Failed
+          
+          One or more compliance standards have failed validation. Please address the compliance issues before deployment.")
+          
+          ---
+          
+          *Generated by Fortress Compliance Pipeline*
+          EOF
+          
+      - name: 📤 Upload Final Compliance Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-compliance-reports-${{ github.sha }}
+          path: final-compliance-reports/
+          
+      - name: 💬 Comment Compliance Results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('final-compliance-reports/compliance-dashboard.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+            
+      - name: ❌ Fail Build if Compliance Gates Failed
+        if: env.COMPLIANCE_GATE_STATUS == 'FAILED'
+        run: |
+          echo "❌ Compliance quality gates failed. Build blocked for compliance reasons."
+          echo "Please address the compliance violations before proceeding."
+          exit 1

@@ -1,0 +1,185 @@
+# =============================================================================
+# Pat Fortress Plugin Runtime - Multi-stage Production Dockerfile
+# =============================================================================
+
+# ================================
+# Stage 1: Go Builder
+# ================================
+FROM golang:1.21-alpine AS go-builder
+
+RUN apk --no-cache add ca-certificates git tzdata build-base && \
+    addgroup -g 1001 fortress && \
+    adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+# Build plugin runtime engine
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s' \
+    -o fortress-plugin-runtime \
+    ./cmd/plugin-runtime/main.go
+
+# ================================
+# Stage 2: Node.js Builder
+# ================================
+FROM node:18-alpine AS node-builder
+
+WORKDIR /build
+
+# Copy plugin system files
+COPY plugins/ ./plugins/
+
+# Build each plugin
+RUN for dir in plugins/*/; do \
+        if [ -f "$dir/package.json" ]; then \
+            echo "Building plugin in $dir"; \
+            cd "$dir" && npm ci --only=production && npm run build 2>/dev/null || true; \
+            cd /build; \
+        fi \
+    done
+
+# ================================
+# Stage 3: Python Builder (for Python plugins)
+# ================================
+FROM python:3.11-alpine AS python-builder
+
+WORKDIR /build
+
+# Copy Python plugin requirements
+COPY plugins/*/requirements.txt plugins/ 2>/dev/null || true
+
+# Install Python dependencies if they exist
+RUN find plugins -name "requirements.txt" -exec pip install --user -r {} \; 2>/dev/null || true
+
+# ================================
+# Stage 4: Production Runtime
+# ================================
+FROM alpine:3.18 AS production
+
+# Install runtime dependencies for all languages
+RUN apk --no-cache add \
+    ca-certificates \
+    curl \
+    tzdata \
+    nodejs \
+    npm \
+    python3 \
+    py3-pip \
+    dumb-init \
+    && addgroup -g 1001 fortress \
+    && adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+# Create secure plugin directories
+RUN mkdir -p \
+    /app/plugins \
+    /app/logs \
+    /app/temp \
+    /app/runtime \
+    /app/storage \
+    /var/lib/fortress-plugins \
+    && chown -R 1001:1001 /app /var/lib/fortress-plugins
+
+# Copy built Go plugin runtime
+COPY --from=go-builder --chown=1001:1001 /build/fortress-plugin-runtime /usr/local/bin/
+
+# Copy built Node.js plugins
+COPY --from=node-builder --chown=1001:1001 /build/plugins /app/plugins
+
+# Copy Python dependencies
+COPY --from=python-builder --chown=1001:1001 /root/.local /home/fortress/.local
+
+# Copy plugin runtime configuration
+COPY --chown=1001:1001 config/plugins/ /app/config/
+
+# Switch to non-root user
+USER 1001:1001
+
+WORKDIR /app
+
+# Environment variables
+ENV PLUGIN_RUNTIME_PORT=8026 \
+    MAX_PLUGIN_MEMORY=128 \
+    MAX_PLUGIN_EXECUTION_TIME=30000 \
+    MAX_CONCURRENT_PLUGINS=10 \
+    PLUGIN_ISOLATION_ENABLED=true \
+    PLUGIN_NETWORK_ACCESS=restricted \
+    PLUGIN_FS_ACCESS=sandbox \
+    LOG_LEVEL=info \
+    FORTRESS_ENV=production \
+    PYTHONPATH=/home/fortress/.local/lib/python3.11/site-packages:$PYTHONPATH
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PLUGIN_RUNTIME_PORT}/health || exit 1
+
+# Expose plugin runtime port
+EXPOSE 8026
+
+# Resource limits (enforced by runtime)
+LABEL com.fortress.plugin.memory="128m" \
+      com.fortress.plugin.cpu="0.5" \
+      com.fortress.plugin.network="restricted"
+
+# Graceful shutdown
+STOPSIGNAL SIGTERM
+
+# Use dumb-init for proper signal handling in container
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+# Start plugin runtime
+CMD ["/usr/local/bin/fortress-plugin-runtime", \
+     "--port", "8026", \
+     "--plugins-dir", "/app/plugins", \
+     "--config", "/app/config/runtime.yaml"]
+
+# ================================
+# Development Stage
+# ================================
+FROM node:18-alpine AS development
+
+RUN apk --no-cache add \
+    ca-certificates \
+    curl \
+    tzdata \
+    python3 \
+    py3-pip \
+    build-base \
+    git \
+    && addgroup -g 1001 fortress \
+    && adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /app
+
+# Install development tools
+RUN npm install -g nodemon && \
+    pip3 install --break-system-packages watchdog
+
+# Copy source
+COPY . .
+
+# Create directories
+RUN mkdir -p plugins logs temp runtime storage && \
+    chown -R 1001:1001 /app
+
+USER 1001:1001
+
+# Development environment variables
+ENV NODE_ENV=development \
+    LOG_LEVEL=debug \
+    PLUGIN_HOT_RELOAD=true \
+    PLUGIN_ISOLATION_ENABLED=false
+
+# Development health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8026/health || exit 1
+
+EXPOSE 8026
+
+# Development with hot reload
+CMD ["nodemon", "--watch", "plugins", "--ext", "js,ts,py", \
+     "--exec", "/usr/local/bin/fortress-plugin-runtime --dev"]

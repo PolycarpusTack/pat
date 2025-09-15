@@ -1,0 +1,194 @@
+# Dependabot configuration for automated dependency management
+version: 2
+updates:
+  # Go dependencies
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "02:00"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "fortress-maintainers"
+    assignees:
+      - "fortress-security-team"
+    commit-message:
+      prefix: "deps(go)"
+      prefix-development: "deps-dev(go)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "go"
+      - "security"
+    # Security updates are prioritized
+    vulnerability-alerts:
+      enabled: true
+    # Group updates for better organization
+    groups:
+      # Critical security dependencies
+      security-dependencies:
+        patterns:
+          - "golang.org/x/crypto*"
+          - "github.com/golang-jwt/jwt*"
+          - "github.com/aws/aws-sdk-go*"
+        priority: 10
+      # Core framework dependencies
+      core-dependencies:
+        patterns:
+          - "github.com/gin-gonic/gin*"
+          - "github.com/gorilla/mux*"
+          - "github.com/lib/pq*"
+          - "go.uber.org/zap*"
+        priority: 5
+      # Development and testing dependencies
+      dev-dependencies:
+        patterns:
+          - "github.com/stretchr/testify*"
+          - "github.com/golang/mock*"
+        priority: 1
+    # Version constraints
+    ignore:
+      # Pin to major version 1 for stability
+      - dependency-name: "github.com/gin-gonic/gin"
+        versions: ["2.x"]
+      # Ignore patch updates for stable dependencies
+      - dependency-name: "go.uber.org/zap"
+        update-types: ["version-update:semver-patch"]
+    # Allow beta and pre-release versions for development dependencies only
+    allow:
+      - dependency-type: "development"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+
+  # Frontend dependencies (Node.js/npm)
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "03:00"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "fortress-frontend-team"
+    assignees:
+      - "fortress-maintainers"
+    commit-message:
+      prefix: "deps(npm)"
+      prefix-development: "deps-dev(npm)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "frontend"
+      - "npm"
+    vulnerability-alerts:
+      enabled: true
+    # Group updates for React ecosystem
+    groups:
+      # Security-critical frontend dependencies
+      security-dependencies:
+        patterns:
+          - "next*"
+          - "@apollo/client*"
+          - "react*"
+        priority: 10
+      # UI framework dependencies
+      ui-dependencies:
+        patterns:
+          - "@mui/material*"
+          - "@mui/icons-material*"
+          - "@emotion/*"
+        priority: 5
+      # Development tools
+      dev-tools:
+        patterns:
+          - "@types/*"
+          - "eslint*"
+          - "typescript*"
+          - "@storybook/*"
+        priority: 2
+      # Testing dependencies
+      testing-dependencies:
+        patterns:
+          - "@testing-library/*"
+          - "jest*"
+        priority: 1
+    ignore:
+      # Pin Next.js to v14 for stability
+      - dependency-name: "next"
+        versions: ["15.x"]
+      # Avoid major React updates without explicit approval
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+
+  # Docker dependencies
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "02:00"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "fortress-devops-team"
+    commit-message:
+      prefix: "deps(docker)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "infrastructure"
+    # Only security updates for Docker base images
+    allow:
+      - dependency-type: "production"
+        update-types:
+          - "version-update:semver-patch"
+          - "version-update:semver-minor"
+    ignore:
+      # Avoid major version updates for base images
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "redis"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "golang"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "03:00"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "fortress-devops-team"
+    commit-message:
+      prefix: "deps(actions)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "ci-cd"
+    # Group common action updates
+    groups:
+      core-actions:
+        patterns:
+          - "actions/checkout*"
+          - "actions/setup-go*"
+          - "actions/setup-node*"
+          - "actions/upload-artifact*"
+          - "actions/download-artifact*"
+        priority: 5
+      security-actions:
+        patterns:
+          - "github/codeql-action*"
+          - "aquasecurity/trivy-action*"
+          - "snyk/actions*"
+        priority: 10

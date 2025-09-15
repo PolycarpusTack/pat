@@ -1,0 +1,462 @@
+# =============================================================================
+# Pat Fortress - Advanced Alerting Rules
+# Advanced business logic, security, and performance alerts
+# =============================================================================
+
+groups:
+
+# =============================================================================
+# Advanced Business Logic Alerts
+# =============================================================================
+
+- name: fortress-advanced-business
+  interval: 60s
+  rules:
+
+  # Email Delivery Rate Degradation
+  - alert: EmailDeliveryRateDegradation
+    expr: (
+      sum(rate(fortress_emails_delivered_total[10m])) / 
+      sum(rate(fortress_emails_processed_total[10m]))
+    ) < 0.90
+    for: 5m
+    labels:
+      severity: critical
+      category: business
+      service: email-delivery
+    annotations:
+      summary: "Email delivery rate critically low"
+      description: "Email delivery success rate has dropped to {{ $value | humanizePercentage }} (below 90% threshold)"
+      runbook_url: "https://fortress.pat.local/runbooks/email-delivery-failure"
+
+  # Abnormal Email Volume
+  - alert: EmailVolumeAnomalyHigh
+    expr: (
+      rate(fortress_emails_processed_total[5m]) > 
+      (avg_over_time(rate(fortress_emails_processed_total[5m])[7d:1h]) * 3)
+    )
+    for: 10m
+    labels:
+      severity: warning
+      category: business
+      service: email-processing
+    annotations:
+      summary: "Abnormally high email volume detected"
+      description: "Email processing rate is {{ $value }} emails/sec, which is 3x higher than the 7-day average"
+
+  - alert: EmailVolumeAnomalyLow
+    expr: (
+      rate(fortress_emails_processed_total[5m]) < 
+      (avg_over_time(rate(fortress_emails_processed_total[5m])[7d:1h]) * 0.1)
+    )
+    for: 15m
+    labels:
+      severity: warning
+      category: business
+      service: email-processing
+    annotations:
+      summary: "Abnormally low email volume detected"
+      description: "Email processing rate is {{ $value }} emails/sec, which is 90% lower than the 7-day average"
+
+  # Storage Quota Alerts with Prediction
+  - alert: StorageQuotaNearFull
+    expr: (
+      fortress_email_storage_used_bytes / fortress_email_storage_quota_bytes * 100
+    ) > 85
+    for: 5m
+    labels:
+      severity: warning
+      category: business
+      service: storage
+    annotations:
+      summary: "Email storage quota approaching limit"
+      description: "Email storage is {{ $value | humanizePercentage }} full"
+
+  - alert: StorageGrowthRateHigh
+    expr: (
+      predict_linear(fortress_email_storage_used_bytes[2h], 24*3600) >
+      fortress_email_storage_quota_bytes
+    )
+    for: 30m
+    labels:
+      severity: warning
+      category: business
+      service: storage
+    annotations:
+      summary: "Storage will exceed quota in 24 hours"
+      description: "Based on current growth rate, storage will exceed quota in approximately 24 hours"
+
+  # Plugin System Health
+  - alert: PluginCascadeFailure
+    expr: (
+      sum by (plugin_name) (rate(fortress_plugin_executions_total{result="failed"}[10m])) /
+      sum by (plugin_name) (rate(fortress_plugin_executions_total[10m]))
+    ) > 0.5
+    for: 5m
+    labels:
+      severity: critical
+      category: business
+      service: plugin-runtime
+    annotations:
+      summary: "Plugin cascade failure detected"
+      description: "Plugin {{ $labels.plugin_name }} has a failure rate of {{ $value | humanizePercentage }}"
+
+  # Workflow SLA Violations
+  - alert: WorkflowSLAViolation
+    expr: (
+      histogram_quantile(0.95, sum(rate(fortress_workflow_step_duration_seconds_bucket[10m])) by (le, workflow_name))
+    ) > 300  # 5 minutes SLA
+    for: 5m
+    labels:
+      severity: warning
+      category: business
+      service: workflow-engine
+    annotations:
+      summary: "Workflow SLA violation"
+      description: "Workflow {{ $labels.workflow_name }} 95th percentile execution time is {{ $value }} seconds (SLA: 300s)"
+
+# =============================================================================
+# Advanced Security Alerts
+# =============================================================================
+
+- name: fortress-advanced-security
+  interval: 30s
+  rules:
+
+  # Distributed Brute Force Attack
+  - alert: DistributedBruteForceAttack
+    expr: (
+      count by (username) (
+        (
+          increase(fortress_failed_login_attempts_total[5m]) > 5
+        ) and on (username) (
+          count by (username) (fortress_failed_login_attempts_total) > 10
+        )
+      )
+    ) > 0
+    for: 2m
+    labels:
+      severity: critical
+      category: security
+      service: authentication
+    annotations:
+      summary: "Distributed brute force attack detected"
+      description: "User {{ $labels.username }} is experiencing failed login attempts from {{ $value }} different IPs"
+
+  # Credential Stuffing Attack
+  - alert: CredentialStuffingAttack
+    expr: (
+      rate(fortress_failed_login_attempts_total[5m]) > 2.0 and
+      (
+        count by (source_ip) (
+          increase(fortress_failed_login_attempts_total[5m]) > 20
+        )
+      ) > 5
+    )
+    for: 3m
+    labels:
+      severity: critical
+      category: security
+      service: authentication
+    annotations:
+      summary: "Credential stuffing attack detected"
+      description: "Multiple IPs attempting login with high failure rate, indicating credential stuffing"
+
+  # Anomalous API Usage Pattern
+  - alert: AnomalousAPIUsagePattern
+    expr: (
+      sum by (endpoint, source_ip) (rate(fortress_http_requests_total[5m])) >
+      (
+        avg_over_time(
+          sum by (endpoint, source_ip) (rate(fortress_http_requests_total[5m]))[7d:1h]
+        ) * 10
+      )
+    )
+    for: 10m
+    labels:
+      severity: warning
+      category: security
+      service: api
+    annotations:
+      summary: "Anomalous API usage pattern detected"
+      description: "IP {{ $labels.source_ip }} is accessing {{ $labels.endpoint }} at {{ $value }}x normal rate"
+
+  # Data Exfiltration Attempt
+  - alert: DataExfiltrationAttempt
+    expr: (
+      sum by (source_ip) (rate(fortress_http_response_size_bytes[10m])) >
+      100 * 1024 * 1024  # 100MB per 10 minutes
+    )
+    for: 10m
+    labels:
+      severity: critical
+      category: security
+      service: api
+    annotations:
+      summary: "Potential data exfiltration attempt"
+      description: "IP {{ $labels.source_ip }} has downloaded {{ $value | humanizeBytes }} in 10 minutes"
+
+  # Privilege Escalation Attempt
+  - alert: PrivilegeEscalationAttempt
+    expr: (
+      increase(fortress_security_alerts_total{alert_type="privilege_escalation"}[5m]) > 0
+    )
+    for: 0s
+    labels:
+      severity: critical
+      category: security
+      service: authentication
+    annotations:
+      summary: "Privilege escalation attempt detected"
+      description: "Potential privilege escalation attempt from {{ $labels.source_ip }}"
+
+# =============================================================================
+# Performance and Capacity Alerts
+# =============================================================================
+
+- name: fortress-performance-capacity
+  interval: 30s
+  rules:
+
+  # Memory Leak Detection
+  - alert: MemoryLeakDetected
+    expr: (
+      increase(process_resident_memory_bytes[30m]) >
+      (process_resident_memory_bytes offset 30m) * 0.2
+    )
+    for: 15m
+    labels:
+      severity: warning
+      category: performance
+      service: "{{ $labels.job }}"
+    annotations:
+      summary: "Potential memory leak detected"
+      description: "Service {{ $labels.job }} memory usage has increased by {{ $value | humanizeBytes }} in 30 minutes"
+
+  # Database Connection Pool Exhaustion
+  - alert: DatabaseConnectionPoolExhaustion
+    expr: (
+      fortress_database_connections_active /
+      fortress_database_connections_max * 100
+    ) > 90
+    for: 5m
+    labels:
+      severity: critical
+      category: performance
+      service: database
+    annotations:
+      summary: "Database connection pool near exhaustion"
+      description: "Database connection pool is {{ $value | humanizePercentage }} full"
+
+  # Cache Hit Rate Degradation
+  - alert: CacheHitRateDegradation
+    expr: (
+      sum(rate(fortress_cache_hits_total[10m])) /
+      (sum(rate(fortress_cache_hits_total[10m])) + sum(rate(fortress_cache_misses_total[10m])))
+    ) < 0.7
+    for: 10m
+    labels:
+      severity: warning
+      category: performance
+      service: cache
+    annotations:
+      summary: "Cache hit rate degradation"
+      description: "Cache hit rate has dropped to {{ $value | humanizePercentage }} (below 70% threshold)"
+
+  # Queue Backlog Growth Rate
+  - alert: QueueBacklogGrowthRate
+    expr: (
+      predict_linear(fortress_email_queue_size[10m], 3600) >
+      fortress_email_queue_size * 3
+    )
+    for: 10m
+    labels:
+      severity: warning
+      category: performance
+      service: email-processing
+    annotations:
+      summary: "Email queue growing at unsustainable rate"
+      description: "Email queue {{ $labels.queue_name }} will triple in size within an hour if current growth continues"
+
+  # API Rate Limiting Effectiveness
+  - alert: RateLimitIneffective
+    expr: (
+      rate(fortress_blocked_requests_total[5m]) <
+      rate(fortress_rate_limit_triggers_total[5m]) * 0.8
+    )
+    for: 10m
+    labels:
+      severity: warning
+      category: performance
+      service: api
+    annotations:
+      summary: "Rate limiting may be ineffective"
+      description: "Rate limit triggers are not resulting in proportional request blocking"
+
+# =============================================================================
+# Data Quality and Integrity Alerts
+# =============================================================================
+
+- name: fortress-data-integrity
+  interval: 60s
+  rules:
+
+  # Email Data Corruption
+  - alert: EmailDataCorruption
+    expr: (
+      fortress_emails_with_missing_content / fortress_emails_total * 100
+    ) > 1
+    for: 5m
+    labels:
+      severity: critical
+      category: data-integrity
+      service: email-storage
+    annotations:
+      summary: "Email data corruption detected"
+      description: "{{ $value | humanizePercentage }} of emails have missing or corrupted content"
+
+  # Database Replication Drift
+  - alert: DatabaseReplicationDrift
+    expr: (
+      abs(
+        fortress_database_record_count{database="primary"} -
+        fortress_database_record_count{database="replica"}
+      ) / fortress_database_record_count{database="primary"} * 100
+    ) > 5
+    for: 15m
+    labels:
+      severity: warning
+      category: data-integrity
+      service: database
+    annotations:
+      summary: "Database replication drift detected"
+      description: "Primary and replica databases have {{ $value | humanizePercentage }} difference in record count"
+
+  # Workflow State Inconsistency
+  - alert: WorkflowStateInconsistency
+    expr: (
+      fortress_workflow_orphaned_steps > 0
+    )
+    for: 10m
+    labels:
+      severity: warning
+      category: data-integrity
+      service: workflow-engine
+    annotations:
+      summary: "Workflow state inconsistency detected"
+      description: "{{ $value }} orphaned workflow steps detected, indicating state corruption"
+
+# =============================================================================
+# Synthetic Monitoring Alerts
+# =============================================================================
+
+- name: fortress-synthetic-monitoring
+  interval: 30s
+  rules:
+
+  # End-to-End Email Processing Test
+  - alert: EndToEndEmailProcessingFailure
+    expr: (
+      fortress_synthetic_email_test_success_rate < 0.95
+    )
+    for: 5m
+    labels:
+      severity: critical
+      category: synthetic
+      service: email-processing
+    annotations:
+      summary: "End-to-end email processing test failing"
+      description: "Synthetic email processing test success rate is {{ $value | humanizePercentage }}"
+
+  # API Health Check
+  - alert: APIHealthCheckFailure
+    expr: (
+      fortress_api_health_check_success == 0
+    )
+    for: 2m
+    labels:
+      severity: critical
+      category: synthetic
+      service: api
+    annotations:
+      summary: "API health check failing"
+      description: "API health check has been failing for more than 2 minutes"
+
+  # Plugin Integration Test
+  - alert: PluginIntegrationTestFailure
+    expr: (
+      fortress_plugin_integration_test_failures > 0
+    )
+    for: 5m
+    labels:
+      severity: warning
+      category: synthetic
+      service: plugin-runtime
+    annotations:
+      summary: "Plugin integration tests failing"
+      description: "{{ $value }} plugin integration tests are currently failing"
+
+# =============================================================================
+# ML-Enhanced Anomaly Detection Alerts
+# =============================================================================
+
+- name: fortress-ml-anomalies
+  interval: 120s
+  rules:
+
+  # Response Time Anomaly Detection
+  - alert: ResponseTimeAnomaly
+    expr: (
+      (
+        histogram_quantile(0.95, sum(rate(fortress_http_request_duration_seconds_bucket[5m])) by (le, service)) -
+        avg_over_time(histogram_quantile(0.95, sum(rate(fortress_http_request_duration_seconds_bucket[5m])) by (le, service))[7d:1h])
+      ) /
+      stddev_over_time(histogram_quantile(0.95, sum(rate(fortress_http_request_duration_seconds_bucket[5m])) by (le, service))[7d:1h])
+    ) > 3  # 3 standard deviations
+    for: 10m
+    labels:
+      severity: warning
+      category: performance
+      service: "{{ $labels.service }}"
+    annotations:
+      summary: "Response time anomaly detected"
+      description: "Service {{ $labels.service }} response time is {{ $value }} standard deviations above normal"
+
+  # Error Rate Anomaly Detection
+  - alert: ErrorRateAnomaly
+    expr: (
+      (
+        sum(rate(fortress_http_requests_total{status_code=~"5.."}[5m])) by (service) /
+        sum(rate(fortress_http_requests_total[5m])) by (service) * 100 -
+        avg_over_time(sum(rate(fortress_http_requests_total{status_code=~"5.."}[5m])) by (service) /
+        sum(rate(fortress_http_requests_total[5m])) by (service) * 100[7d:1h])
+      ) /
+      stddev_over_time(sum(rate(fortress_http_requests_total{status_code=~"5.."}[5m])) by (service) /
+      sum(rate(fortress_http_requests_total[5m])) by (service) * 100[7d:1h])
+    ) > 2  # 2 standard deviations
+    for: 10m
+    labels:
+      severity: warning
+      category: performance
+      service: "{{ $labels.service }}"
+    annotations:
+      summary: "Error rate anomaly detected"
+      description: "Service {{ $labels.service }} error rate is {{ $value }} standard deviations above normal"
+
+  # Traffic Pattern Anomaly
+  - alert: TrafficPatternAnomaly
+    expr: (
+      (
+        sum(rate(fortress_http_requests_total[5m])) by (service) -
+        avg_over_time(sum(rate(fortress_http_requests_total[5m])) by (service)[7d:1h])
+      ) /
+      stddev_over_time(sum(rate(fortress_http_requests_total[5m])) by (service)[7d:1h])
+    ) > 3  # 3 standard deviations
+    for: 15m
+    labels:
+      severity: info
+      category: traffic
+      service: "{{ $labels.service }}"
+    annotations:
+      summary: "Traffic pattern anomaly detected"
+      description: "Service {{ $labels.service }} traffic is {{ $value }} standard deviations from normal pattern"

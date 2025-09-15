@@ -1,0 +1,86 @@
+# =============================================================================
+# Pat Fortress - Grafana Dashboard Provisioning Configuration
+# Automated dashboard deployment and management
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+
+# =============================================================================
+# Executive Dashboards - Business KPIs and High-Level Metrics
+# =============================================================================
+- name: 'executive'
+  orgId: 1
+  folder: 'Executive'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/executive
+
+# =============================================================================
+# Operational Dashboards - Technical Operations and System Health
+# =============================================================================  
+- name: 'operational'
+  orgId: 1
+  folder: 'Operations'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/operational
+
+# =============================================================================
+# Security Dashboards - Security Monitoring and Threat Detection
+# =============================================================================
+- name: 'security'
+  orgId: 1
+  folder: 'Security'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/security
+
+# =============================================================================
+# Infrastructure Dashboards - System Resources and Performance
+# =============================================================================
+- name: 'infrastructure'
+  orgId: 1
+  folder: 'Infrastructure'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/infrastructure
+
+# =============================================================================
+# Application Dashboards - Service-Specific Monitoring
+# =============================================================================
+- name: 'applications'
+  orgId: 1
+  folder: 'Applications'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/applications
+
+# =============================================================================
+# Business Dashboards - Email Processing and Customer Service Metrics
+# =============================================================================
+- name: 'business'
+  orgId: 1
+  folder: 'Business'
+  type: file
+  disableDeletion: false
+  updateIntervalSeconds: 30
+  allowUiUpdates: true
+  options:
+    path: /etc/grafana/provisioning/dashboards/business

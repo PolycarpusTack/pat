@@ -1,0 +1,523 @@
+# 📊 Fortress Pipeline Monitoring Configuration
+# Comprehensive monitoring and alerting for CI/CD pipelines
+
+# ===== PROMETHEUS MONITORING RULES =====
+groups:
+  - name: fortress-pipeline-rules
+    interval: 30s
+    rules:
+      # Pipeline Execution Metrics
+      - alert: PipelineExecutionTimeHigh
+        expr: github_actions_workflow_run_duration_seconds > 7200  # 2 hours
+        for: 0m
+        labels:
+          severity: warning
+          component: pipeline
+          environment: "{{ $labels.environment }}"
+        annotations:
+          summary: "Pipeline execution time is high"
+          description: "Pipeline {{ $labels.workflow_name }} in {{ $labels.environment }} has been running for {{ $value }}s"
+          runbook_url: "https://docs.pat-fortress.com/runbooks/pipeline-performance"
+          
+      - alert: PipelineFailureRateHigh
+        expr: rate(github_actions_workflow_run_failures_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          component: pipeline
+          environment: "{{ $labels.environment }}"
+        annotations:
+          summary: "High pipeline failure rate detected"
+          description: "Pipeline failure rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+          runbook_url: "https://docs.pat-fortress.com/runbooks/pipeline-failures"
+          
+      # Quality Gate Metrics
+      - alert: QualityGateFailureSpike
+        expr: increase(fortress_quality_gate_failures_total[10m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+          component: quality-gates
+          gate_type: "{{ $labels.gate_type }}"
+        annotations:
+          summary: "Quality gate failure spike detected"
+          description: "{{ $labels.gate_type }} quality gate has failed {{ $value }} times in the last 10 minutes"
+          runbook_url: "https://docs.pat-fortress.com/runbooks/quality-gates"
+          
+      - alert: SecurityGateCriticalFailure
+        expr: fortress_quality_gate_failures_total{gate_type="security",severity="critical"} > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: security
+        annotations:
+          summary: "Critical security quality gate failure"
+          description: "Critical security vulnerabilities detected in pipeline"
+          runbook_url: "https://docs.pat-fortress.com/runbooks/security-failures"
+          action_required: "immediate"
+          
+      # Deployment Metrics
+      - alert: DeploymentFrequencyLow
+        expr: rate(fortress_deployments_total[24h]) < 0.5  # Less than 12 deployments per day
+        for: 1h
+        labels:
+          severity: info
+          component: deployment
+        annotations:
+          summary: "Deployment frequency is low"
+          description: "Deployment rate is {{ $value | humanize }} per day, below expected threshold"
+          
+      - alert: DeploymentRollbackFrequent
+        expr: rate(fortress_rollbacks_total[1h]) > 0.1  # More than 6 rollbacks per hour
+        for: 5m
+        labels:
+          severity: warning
+          component: deployment
+        annotations:
+          summary: "Frequent deployment rollbacks detected"
+          description: "Rollback rate is {{ $value | humanize }} per hour"
+          runbook_url: "https://docs.pat-fortress.com/runbooks/deployment-stability"
+          
+      # Performance Metrics
+      - alert: TestExecutionTimeTrend
+        expr: increase(fortress_test_duration_seconds[1h]) > increase(fortress_test_duration_seconds[1h] offset 24h) * 1.5
+        for: 10m
+        labels:
+          severity: warning
+          component: testing
+        annotations:
+          summary: "Test execution time trending upward"
+          description: "Test execution time has increased by {{ $value }}% compared to 24h ago"
+          
+      - alert: ArtifactSizeGrowth
+        expr: fortress_artifact_size_bytes > fortress_artifact_size_bytes offset 7d * 2
+        for: 0m
+        labels:
+          severity: info
+          component: artifacts
+        annotations:
+          summary: "Artifact size has doubled"
+          description: "Build artifact size is {{ $value | humanizeBytes }}, doubled from last week"
+          
+  - name: fortress-infrastructure-rules
+    interval: 60s
+    rules:
+      # CI/CD Infrastructure Health
+      - alert: GitHubActionsRunnerDown
+        expr: up{job="github-runners"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "GitHub Actions runner is down"
+          description: "Runner {{ $labels.runner_name }} has been down for more than 5 minutes"
+          
+      - alert: ArtifactStorageSpaceLow
+        expr: (1 - (fortress_artifact_storage_free_bytes / fortress_artifact_storage_total_bytes)) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Artifact storage space running low"
+          description: "Artifact storage is {{ $value | humanizePercentage }} full"
+          
+      - alert: DatabaseConnectionFailures
+        expr: rate(fortress_database_connection_errors_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Database connection failures detected"
+          description: "Database connection error rate: {{ $value }} errors/sec"
+
+# ===== GRAFANA DASHBOARD DEFINITIONS =====
+dashboards:
+  - name: fortress-pipeline-overview
+    title: "🛡️ Fortress CI/CD Pipeline Overview"
+    tags: ["fortress", "cicd", "pipeline"]
+    panels:
+      - title: "Pipeline Success Rate"
+        type: stat
+        targets:
+          - expr: 1 - (rate(github_actions_workflow_run_failures_total[24h]) / rate(github_actions_workflow_run_total[24h]))
+        fieldConfig:
+          unit: percentunit
+          min: 0
+          max: 1
+          thresholds:
+            - color: red
+              value: 0.95
+            - color: yellow
+              value: 0.98
+            - color: green
+              value: 0.99
+              
+      - title: "Pipeline Execution Time"
+        type: timeseries
+        targets:
+          - expr: github_actions_workflow_run_duration_seconds
+            legend: "{{ workflow_name }}"
+        fieldConfig:
+          unit: s
+          
+      - title: "Quality Gates Status"
+        type: bargauge
+        targets:
+          - expr: fortress_quality_gate_pass_rate by (gate_type)
+            legend: "{{ gate_type }}"
+        fieldConfig:
+          unit: percentunit
+          displayMode: basic
+          orientation: horizontal
+          
+      - title: "Deployment Frequency"
+        type: timeseries
+        targets:
+          - expr: rate(fortress_deployments_total[1h]) * 3600
+            legend: "Deployments/hour"
+        fieldConfig:
+          unit: short
+          
+      - title: "Top Failed Quality Gates"
+        type: table
+        targets:
+          - expr: topk(10, increase(fortress_quality_gate_failures_total[24h]))
+        fieldConfig:
+          displayMode: table
+          
+  - name: fortress-security-dashboard
+    title: "🔒 Fortress Security Dashboard"
+    tags: ["fortress", "security", "compliance"]
+    panels:
+      - title: "Critical Vulnerabilities"
+        type: stat
+        targets:
+          - expr: fortress_vulnerabilities_total{severity="critical"}
+        fieldConfig:
+          color: red
+          unit: short
+          max: 0
+          
+      - title: "Security Scan Results Trend"
+        type: timeseries
+        targets:
+          - expr: fortress_vulnerabilities_total by (severity)
+            legend: "{{ severity }}"
+        fieldConfig:
+          unit: short
+          
+      - title: "Compliance Score"
+        type: gauge
+        targets:
+          - expr: fortress_compliance_score
+        fieldConfig:
+          unit: percent
+          min: 0
+          max: 100
+          thresholds:
+            - color: red
+              value: 70
+            - color: yellow
+              value: 85
+            - color: green
+              value: 95
+              
+      - title: "Security Quality Gate Failures"
+        type: timeseries
+        targets:
+          - expr: rate(fortress_quality_gate_failures_total{gate_type="security"}[5m])
+        fieldConfig:
+          unit: ops
+          
+  - name: fortress-performance-dashboard
+    title: "⚡ Fortress Performance Dashboard"
+    tags: ["fortress", "performance", "testing"]
+    panels:
+      - title: "Test Execution Time"
+        type: timeseries
+        targets:
+          - expr: fortress_test_duration_seconds by (test_type)
+            legend: "{{ test_type }}"
+        fieldConfig:
+          unit: s
+          
+      - title: "Performance Test Results"
+        type: timeseries
+        targets:
+          - expr: fortress_performance_test_p95_response_time
+            legend: "P95 Response Time"
+          - expr: fortress_performance_test_error_rate
+            legend: "Error Rate"
+        fieldConfig:
+          unit: ms
+          
+      - title: "Load Test Throughput"
+        type: timeseries
+        targets:
+          - expr: fortress_load_test_throughput
+        fieldConfig:
+          unit: reqps
+          
+      - title: "Performance Quality Gate Status"
+        type: stat
+        targets:
+          - expr: fortress_quality_gate_pass_rate{gate_type="performance"}
+        fieldConfig:
+          unit: percentunit
+
+# ===== ALERTMANAGER CONFIGURATION =====
+alertmanager:
+  global:
+    slack_api_url: '{{ env "SLACK_WEBHOOK_URL" }}'
+    
+  templates:
+    - '/etc/alertmanager/templates/*.tmpl'
+    
+  route:
+    group_by: ['alertname', 'severity', 'component']
+    group_wait: 10s
+    group_interval: 10s
+    repeat_interval: 12h
+    receiver: 'default'
+    routes:
+      - match:
+          severity: critical
+        receiver: 'critical-alerts'
+        group_wait: 0s
+        repeat_interval: 5m
+        
+      - match:
+          component: security
+        receiver: 'security-team'
+        group_wait: 0s
+        repeat_interval: 15m
+        
+      - match:
+          component: pipeline
+          severity: warning
+        receiver: 'devops-team'
+        repeat_interval: 1h
+        
+  receivers:
+    - name: 'default'
+      slack_configs:
+        - channel: '#fortress-alerts'
+          title: 'Fortress Alert - {{ .GroupLabels.alertname }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+          
+    - name: 'critical-alerts'
+      slack_configs:
+        - channel: '#fortress-critical'
+          title: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}{{ end }}'
+          color: 'danger'
+        - webhook_configs:
+          - url: '{{ env "PAGERDUTY_WEBHOOK_URL" }}'
+            
+    - name: 'security-team'
+      slack_configs:
+        - channel: '#fortress-security'
+          title: '🔒 Security Alert: {{ .GroupLabels.alertname }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}{{ end }}'
+          color: 'danger'
+      email_configs:
+        - to: 'security-team@company.com'
+          subject: 'Fortress Security Alert: {{ .GroupLabels.alertname }}'
+          body: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+          
+    - name: 'devops-team'
+      slack_configs:
+        - channel: '#fortress-devops'
+          title: '⚙️ DevOps Alert: {{ .GroupLabels.alertname }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+          color: 'warning'
+
+# ===== NOTIFICATION TEMPLATES =====
+templates:
+  slack_critical: |
+    {{ range .Alerts }}
+    🚨 *CRITICAL ALERT*
+    
+    *Alert:* {{ .Annotations.summary }}
+    *Description:* {{ .Annotations.description }}
+    *Environment:* {{ .Labels.environment }}
+    *Component:* {{ .Labels.component }}
+    *Severity:* {{ .Labels.severity }}
+    
+    {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+    {{ if .Annotations.action_required }}*Action Required:* {{ .Annotations.action_required }}{{ end }}
+    
+    *Started:* {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+    {{ end }}
+    
+  slack_warning: |
+    {{ range .Alerts }}
+    ⚠️ *WARNING ALERT*
+    
+    *Alert:* {{ .Annotations.summary }}
+    *Description:* {{ .Annotations.description }}
+    *Environment:* {{ .Labels.environment }}
+    *Component:* {{ .Labels.component }}
+    
+    {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+    
+    *Started:* {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+    {{ end }}
+    
+  email_critical: |
+    Subject: 🚨 CRITICAL: Fortress Alert - {{ .GroupLabels.alertname }}
+    
+    {{ range .Alerts }}
+    CRITICAL ALERT TRIGGERED
+    
+    Alert: {{ .Annotations.summary }}
+    Description: {{ .Annotations.description }}
+    Environment: {{ .Labels.environment }}
+    Component: {{ .Labels.component }}
+    Severity: {{ .Labels.severity }}
+    
+    {{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}{{ end }}
+    {{ if .Annotations.action_required }}Action Required: {{ .Annotations.action_required }}{{ end }}
+    
+    Started: {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+    
+    This alert requires immediate attention.
+    {{ end }}
+
+# ===== PIPELINE OBSERVABILITY CONFIGURATION =====
+observability:
+  tracing:
+    enabled: true
+    service_name: "fortress-pipeline"
+    jaeger:
+      endpoint: "http://jaeger-collector:14268/api/traces"
+      
+  logging:
+    enabled: true
+    structured: true
+    level: info
+    outputs:
+      - stdout
+      - file:/var/log/fortress-pipeline.log
+    fields:
+      service: fortress-pipeline
+      version: "{{ env "VERSION" }}"
+      
+  metrics:
+    enabled: true
+    prometheus:
+      port: 9090
+      path: /metrics
+    custom_metrics:
+      - name: fortress_pipeline_duration_seconds
+        type: histogram
+        help: "Duration of pipeline execution"
+        buckets: [10, 30, 60, 300, 600, 1800, 3600, 7200]
+        
+      - name: fortress_quality_gate_duration_seconds
+        type: histogram
+        help: "Duration of quality gate validation"
+        buckets: [5, 15, 30, 60, 120, 300, 600, 1800]
+        
+      - name: fortress_deployment_duration_seconds
+        type: histogram
+        help: "Duration of deployment execution"
+        buckets: [30, 60, 120, 300, 600, 1200, 1800]
+        
+      - name: fortress_rollback_duration_seconds
+        type: histogram
+        help: "Duration of rollback execution"
+        buckets: [10, 30, 60, 120, 300, 600]
+
+# ===== SLA AND SLO DEFINITIONS =====
+sla:
+  pipeline_execution:
+    availability: 99.9%
+    response_time_p95: 30m
+    error_rate: <1%
+    
+  quality_gates:
+    execution_time_p95: 10m
+    availability: 99.5%
+    false_positive_rate: <5%
+    
+  deployment:
+    success_rate: >95%
+    rollback_time_p95: 5m
+    downtime_per_deployment: <30s
+
+slo:
+  - name: "Pipeline Success Rate"
+    description: "Percentage of successful pipeline runs"
+    target: 99%
+    measurement_window: 7d
+    alert_threshold: 95%
+    
+  - name: "Quality Gate Performance"
+    description: "P95 quality gate execution time"
+    target: 10m
+    measurement_window: 24h
+    alert_threshold: 15m
+    
+  - name: "Deployment Frequency" 
+    description: "Number of deployments per day"
+    target: 10
+    measurement_window: 24h
+    alert_threshold: 5
+    
+  - name: "Lead Time"
+    description: "Time from commit to production"
+    target: 4h
+    measurement_window: 7d
+    alert_threshold: 8h
+    
+  - name: "Mean Time to Recovery"
+    description: "Average time to recover from failures"
+    target: 1h
+    measurement_window: 30d
+    alert_threshold: 2h
+
+# ===== INTEGRATION CONFIGURATIONS =====
+integrations:
+  github:
+    webhook_secret: "{{ env "GITHUB_WEBHOOK_SECRET" }}"
+    token: "{{ env "GITHUB_TOKEN" }}"
+    events:
+      - workflow_run
+      - deployment_status
+      - pull_request
+      
+  slack:
+    webhook_url: "{{ env "SLACK_WEBHOOK_URL" }}"
+    channels:
+      critical: "#fortress-critical"
+      security: "#fortress-security"
+      devops: "#fortress-devops"
+      general: "#fortress-alerts"
+      
+  email:
+    smtp_host: "{{ env "SMTP_HOST" }}"
+    smtp_port: 587
+    username: "{{ env "SMTP_USERNAME" }}"
+    password: "{{ env "SMTP_PASSWORD" }}"
+    from: "fortress-alerts@company.com"
+    
+  pagerduty:
+    integration_key: "{{ env "PAGERDUTY_INTEGRATION_KEY" }}"
+    severity_mapping:
+      critical: "critical"
+      warning: "warning"
+      info: "info"
+      
+  datadog:
+    api_key: "{{ env "DATADOG_API_KEY" }}"
+    app_key: "{{ env "DATADOG_APP_KEY" }}"
+    site: "datadoghq.com"
+    
+  prometheus:
+    url: "{{ env "PROMETHEUS_URL" }}"
+    retention: 30d
+    scrape_interval: 30s

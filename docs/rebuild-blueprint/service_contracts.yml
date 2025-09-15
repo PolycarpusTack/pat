@@ -1,0 +1,420 @@
+# Language-agnostic service interface definitions for MailHog
+# Enables rebuilding in any technology stack
+
+services:
+  SMTPService:
+    service_type: "TCP_SERVER"
+    default_port: 1025
+    protocol: "SMTP/ESMTP"
+    
+    business_context: "Receives emails from applications during development/testing"
+    
+    protocol_features:
+      - "ESMTP extensions (EHLO)"
+      - "PIPELINING (RFC 2920)"
+      - "8BITMIME support"
+      - "AUTH PLAIN and CRAM-MD5"
+      - "Maximum message size: 10MB default"
+    
+    commands:
+      HELO:
+        description: "Basic SMTP greeting"
+        response_codes: [250, 500, 501]
+      
+      EHLO:
+        description: "Extended SMTP greeting"
+        response_codes: [250, 500, 501]
+        extensions:
+          - "250-SIZE 10485760"
+          - "250-PIPELINING"
+          - "250-AUTH PLAIN CRAM-MD5"
+          - "250 8BITMIME"
+      
+      MAIL:
+        description: "Sender specification"
+        format: "MAIL FROM:<address>"
+        response_codes: [250, 451, 452, 500, 501, 503]
+      
+      RCPT:
+        description: "Recipient specification"
+        format: "RCPT TO:<address>"
+        response_codes: [250, 251, 450, 451, 452, 500, 501, 503]
+      
+      DATA:
+        description: "Message content transfer"
+        terminator: "\r\n.\r\n"
+        response_codes: [354, 451, 452, 500, 501, 503]
+        final_response_codes: [250, 451, 452]
+      
+      QUIT:
+        description: "Close connection"
+        response_codes: [221, 500]
+      
+      RSET:
+        description: "Reset session"
+        response_codes: [250, 500, 501]
+      
+      NOOP:
+        description: "No operation"
+        response_codes: [250, 500]
+    
+    chaos_monkey:
+      description: "Optional failure injection for testing"
+      failure_modes:
+        - reject_connection
+        - reject_sender
+        - reject_recipient
+        - reject_data
+        - disconnect_after_data
+        - slow_data_transfer
+    
+    message_handling:
+      storage_trigger: "After successful DATA completion"
+      broadcast_trigger: "After storage confirmation"
+      validation:
+        - "Basic email address format"
+        - "Message size limits"
+        - "Line length limits (1000 chars)"
+
+  MessageStorageService:
+    service_type: "STORAGE_ABSTRACTION"
+    
+    business_context: "Persists and retrieves email messages"
+    
+    interface_methods:
+      Store:
+        description: "Store a new message"
+        input:
+          message:
+            type: "Message"
+            required: true
+        output:
+          id:
+            type: "string"
+            description: "Unique message identifier"
+        errors:
+          - "STORAGE_FULL"
+          - "STORAGE_UNAVAILABLE"
+      
+      List:
+        description: "List messages with pagination"
+        input:
+          start:
+            type: "integer"
+            default: 0
+          limit:
+            type: "integer"
+            default: 50
+        output:
+          messages:
+            type: "array[Message]"
+          total:
+            type: "integer"
+      
+      Search:
+        description: "Search messages"
+        input:
+          kind:
+            type: "enum"
+            values: ["from", "to", "containing"]
+          query:
+            type: "string"
+          start:
+            type: "integer"
+            default: 0
+          limit:
+            type: "integer"
+            default: 50
+        output:
+          messages:
+            type: "array[Message]"
+          total:
+            type: "integer"
+      
+      Load:
+        description: "Load single message"
+        input:
+          id:
+            type: "string"
+        output:
+          message:
+            type: "Message"
+        errors:
+          - "NOT_FOUND"
+      
+      DeleteOne:
+        description: "Delete single message"
+        input:
+          id:
+            type: "string"
+        errors:
+          - "NOT_FOUND"
+      
+      DeleteAll:
+        description: "Delete all messages"
+        output:
+          count:
+            type: "integer"
+            description: "Number deleted"
+      
+      Count:
+        description: "Get total message count"
+        output:
+          count:
+            type: "integer"
+    
+    implementations:
+      InMemory:
+        characteristics:
+          - "No persistence"
+          - "Fast performance"
+          - "Limited by RAM"
+          - "Thread-safe with mutex"
+        configuration: {}
+      
+      MongoDB:
+        characteristics:
+          - "Persistent storage"
+          - "Scalable"
+          - "Full-text search"
+          - "External dependency"
+        configuration:
+          uri:
+            type: "string"
+            default: "mongodb://localhost/mailhog"
+          database:
+            type: "string"
+            default: "mailhog"
+          collection:
+            type: "string"
+            default: "messages"
+      
+      Maildir:
+        characteristics:
+          - "File-based persistence"
+          - "Standard format"
+          - "No dependencies"
+          - "Compatible with mail clients"
+        configuration:
+          path:
+            type: "string"
+            default: "./Maildir"
+
+  HTTPAPIService:
+    service_type: "REST_API"
+    base_path: "/api"
+    default_port: 8025
+    
+    business_context: "Provides programmatic access to messages"
+    
+    versioning:
+      v1:
+        status: "frozen"
+        description: "Legacy API, no new features"
+      v2:
+        status: "active"
+        description: "Enhanced features and search"
+    
+    authentication:
+      type: "HTTP_BASIC"
+      optional: true
+      bcrypt_cost: 4
+    
+    real_time_updates:
+      protocol: "Server-Sent Events"
+      endpoint: "/api/v1/events"
+      event_format:
+        event: "message"
+        data:
+          type: "JSON"
+          schema: "MessageSummary"
+      keepalive_interval: "60s"
+    
+    cors_support:
+      enabled: true
+      configurable_origin: true
+      allowed_methods: ["GET", "POST", "DELETE", "OPTIONS"]
+      allowed_headers: ["Content-Type", "Authorization"]
+
+  WebUIService:
+    service_type: "WEB_APPLICATION"
+    base_path: "/"
+    
+    business_context: "User interface for viewing and managing messages"
+    
+    features:
+      - "Real-time message updates"
+      - "Message preview (plain/HTML/source)"
+      - "Download messages and attachments"
+      - "Search functionality"
+      - "Release to real SMTP"
+      - "Responsive design"
+    
+    technical_stack:
+      backend:
+        - "Go templates"
+        - "Custom delimiters: [: :]"
+        - "Embedded assets"
+      frontend:
+        - "Bootstrap CSS"
+        - "jQuery"
+        - "Custom JavaScript"
+        - "EventSource API"
+    
+    asset_serving:
+      method: "Embedded in binary"
+      paths:
+        - "/css/*"
+        - "/js/*"
+        - "/fonts/*"
+        - "/images/*"
+
+  MessageReleaseService:
+    service_type: "SMTP_CLIENT"
+    
+    business_context: "Forwards captured messages to real SMTP servers"
+    
+    configuration:
+      smtp_servers:
+        format: "JSON file or inline config"
+        schema:
+          host:
+            type: "string"
+            required: true
+          port:
+            type: "integer"
+            default: 25
+          username:
+            type: "string"
+          password:
+            type: "string"
+          mechanism:
+            type: "enum"
+            values: ["PLAIN", "CRAM-MD5"]
+          tls:
+            type: "boolean"
+            default: false
+    
+    features:
+      - "Multiple SMTP server support"
+      - "Authentication support"
+      - "TLS/STARTTLS"
+      - "Custom recipient override"
+      - "Delivery confirmation"
+
+data_models:
+  Message:
+    fields:
+      ID:
+        type: "string"
+        description: "Unique identifier"
+      From:
+        type: "EmailPath"
+        description: "Sender information"
+      To:
+        type: "array[EmailPath]"
+        description: "Recipients"
+      Content:
+        type: "MessageContent"
+        description: "Headers and body"
+      Created:
+        type: "timestamp"
+        description: "Receipt time"
+      MIME:
+        type: "MIMEBody"
+        description: "Parsed MIME structure"
+      Raw:
+        type: "RawData"
+        description: "Original SMTP data"
+  
+  EmailPath:
+    fields:
+      Relays:
+        type: "array[string]"
+        description: "SMTP relay chain"
+      Mailbox:
+        type: "string"
+        description: "Local part"
+      Domain:
+        type: "string"
+        description: "Domain part"
+      Params:
+        type: "string"
+        description: "ESMTP parameters"
+      Address:
+        type: "string"
+        description: "Full email address"
+      Name:
+        type: "string"
+        description: "Display name"
+  
+  MessageContent:
+    fields:
+      Headers:
+        type: "map[string]array[string]"
+        description: "All headers"
+      Body:
+        type: "string"
+        description: "Message body"
+      Size:
+        type: "integer"
+        description: "Content size"
+  
+  MIMEBody:
+    fields:
+      Parts:
+        type: "array[MIMEPart]"
+        description: "MIME parts"
+  
+  MIMEPart:
+    fields:
+      Headers:
+        type: "map[string]array[string]"
+      Body:
+        type: "string"
+      Size:
+        type: "integer"
+      ContentType:
+        type: "string"
+      FileName:
+        type: "string"
+
+performance_requirements:
+  smtp_server:
+    connection_limit: 1000
+    message_size_limit: "10MB"
+    processing_time: "<100ms per message"
+  
+  api_server:
+    response_time_p95: "<50ms"
+    concurrent_connections: 1000
+    sse_clients: 100
+  
+  storage:
+    write_time: "<10ms"
+    read_time: "<5ms"
+    search_time: "<100ms for 10k messages"
+
+deployment_patterns:
+  standalone:
+    description: "Single binary, all features"
+    storage: "in-memory"
+    use_case: "Individual developer"
+  
+  team_server:
+    description: "Shared instance"
+    storage: "mongodb"
+    authentication: "enabled"
+    use_case: "Development team"
+  
+  containerized:
+    description: "Docker/Kubernetes"
+    storage: "mongodb or maildir volume"
+    scaling: "horizontal with shared storage"
+    use_case: "CI/CD pipelines"
+  
+  embedded:
+    description: "Test suite integration"
+    storage: "in-memory"
+    lifecycle: "start/stop with tests"
+    use_case: "Automated testing"

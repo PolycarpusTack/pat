@@ -1,0 +1,137 @@
+# =============================================================================
+# Pat Fortress Core - Multi-stage Production Dockerfile
+# =============================================================================
+
+# ================================
+# Stage 1: Go Builder
+# ================================
+FROM golang:1.21-alpine AS go-builder
+
+# Security: Install ca-certificates and create non-root user
+RUN apk --no-cache add ca-certificates git tzdata && \
+    addgroup -g 1001 fortress && \
+    adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /build
+
+# Copy Go modules and download dependencies
+COPY go.mod go.sum ./
+RUN go mod download && \
+    go mod verify
+
+# Copy source code
+COPY . .
+
+# Build the fortress core application
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -a -installsuffix cgo \
+    -o fortress-core \
+    ./main.go
+
+# ================================
+# Stage 2: Node.js Builder (for API components)
+# ================================
+FROM node:18-alpine AS node-builder
+
+WORKDIR /build
+
+# Copy package files
+COPY api/graphql/package*.json ./api/graphql/
+COPY frontend/package*.json ./frontend/
+
+# Install dependencies
+RUN cd api/graphql && npm ci --only=production && \
+    cd ../.. && cd frontend && npm ci --only=production
+
+# Copy and build API
+COPY api/ ./api/
+RUN cd api/graphql && npm run build
+
+# ================================
+# Stage 3: Production Runtime
+# ================================
+FROM scratch AS production
+
+# Copy CA certificates for HTTPS calls
+COPY --from=go-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy timezone data
+COPY --from=go-builder /usr/share/zoneinfo /usr/share/zoneinfo
+
+# Copy user information
+COPY --from=go-builder /etc/passwd /etc/passwd
+COPY --from=go-builder /etc/group /etc/group
+
+# Copy built application
+COPY --from=go-builder --chown=1001:1001 /build/fortress-core /usr/local/bin/fortress-core
+
+# Copy Node.js runtime and built API
+COPY --from=node-builder --chown=1001:1001 /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-builder --chown=1001:1001 /build/api/graphql/dist /app/api
+COPY --from=node-builder --chown=1001:1001 /build/api/graphql/node_modules /app/node_modules
+
+# Create necessary directories
+USER root
+RUN mkdir -p /app/logs /app/storage /app/temp /tmp && \
+    chown -R 1001:1001 /app /tmp
+
+# Switch to non-root user
+USER 1001:1001
+
+# Set working directory
+WORKDIR /app
+
+# Environment variables
+ENV NODE_ENV=production \
+    PORT=8025 \
+    SMTP_PORT=1025 \
+    LOG_LEVEL=info \
+    FORTRESS_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/fortress-core", "health-check"] || exit 1
+
+# Expose ports
+EXPOSE 8025 1025
+
+# Graceful shutdown signal
+STOPSIGNAL SIGTERM
+
+# Start the fortress core application
+ENTRYPOINT ["/usr/local/bin/fortress-core"]
+CMD ["--config", "/app/config/production.yaml"]
+
+# ================================
+# Development Stage (for local dev)
+# ================================
+FROM golang:1.21-alpine AS development
+
+RUN apk --no-cache add git ca-certificates tzdata curl netcat-openbsd && \
+    addgroup -g 1001 fortress && \
+    adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /app
+
+# Install development tools
+RUN go install github.com/cosmtrek/air@latest && \
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# Copy source code
+COPY . .
+
+# Install dependencies
+RUN go mod download
+
+# Switch to non-root user for development
+USER 1001:1001
+
+# Health check for development
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8025/health || exit 1
+
+EXPOSE 8025 1025
+
+# Development command with hot reload
+CMD ["air", "-c", ".air.toml"]

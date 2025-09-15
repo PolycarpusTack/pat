@@ -1,0 +1,324 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mailhog
+  labels:
+    app: mailhog
+
+---
+# ConfigMap for MailHog configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mailhog-config
+  namespace: mailhog
+data:
+  MH_STORAGE: "mongodb"
+  MH_MONGO_URI: "mongodb://mailhog-mongo:27017"
+  MH_MONGO_DB: "mailhog"
+  MH_MONGO_COLLECTION: "messages"
+  MH_CORS_ORIGIN: "*"
+  MH_UI_WEB_PATH: ""
+
+---
+# Secret for authentication (base64 encoded)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mailhog-auth
+  namespace: mailhog
+type: Opaque
+data:
+  # Example: admin:$2a$04$qrZVPgH8JJF7Fc.FHJfWJOZZNbOQQm3BCZM3QzPP.7oJPPiWNNWm6
+  # Password: admin
+  auth.txt: YWRtaW46JDJhJDA0JHFyWlZQZ0g4SkpGN0ZjLkZISmZXSk9aWk5iT1FRbTNCQ1pNM1F6UFAuN29KUFBJV05OV202Cg==
+
+---
+# PersistentVolumeClaim for Maildir storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mailhog-maildir
+  namespace: mailhog
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# Deployment for MailHog
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailhog
+  namespace: mailhog
+  labels:
+    app: mailhog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mailhog
+  template:
+    metadata:
+      labels:
+        app: mailhog
+    spec:
+      containers:
+      - name: mailhog
+        image: mailhog/mailhog:v1.0.1
+        ports:
+        - name: smtp
+          containerPort: 1025
+          protocol: TCP
+        - name: http
+          containerPort: 8025
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: mailhog-config
+        env:
+        - name: MH_AUTH_FILE
+          value: "/auth/auth.txt"
+        volumeMounts:
+        - name: auth
+          mountPath: /auth
+          readOnly: true
+        - name: maildir
+          mountPath: /maildir
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/v2/messages?limit=1
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/v2/messages?limit=1
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: auth
+        secret:
+          secretName: mailhog-auth
+          defaultMode: 0400
+      - name: maildir
+        persistentVolumeClaim:
+          claimName: mailhog-maildir
+
+---
+# Service for MailHog
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailhog
+  namespace: mailhog
+  labels:
+    app: mailhog
+spec:
+  type: ClusterIP
+  ports:
+  - name: smtp
+    port: 1025
+    targetPort: smtp
+    protocol: TCP
+  - name: http
+    port: 8025
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: mailhog
+
+---
+# MongoDB StatefulSet for persistent storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mailhog-mongo
+  namespace: mailhog
+spec:
+  serviceName: mailhog-mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mailhog-mongo
+  template:
+    metadata:
+      labels:
+        app: mailhog-mongo
+    spec:
+      containers:
+      - name: mongo
+        image: mongo:7.0
+        ports:
+        - containerPort: 27017
+          name: mongo
+        env:
+        - name: MONGO_INITDB_DATABASE
+          value: mailhog
+        volumeMounts:
+        - name: mongo-data
+          mountPath: /data/db
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+  volumeClaimTemplates:
+  - metadata:
+      name: mongo-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# Service for MongoDB
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailhog-mongo
+  namespace: mailhog
+spec:
+  type: ClusterIP
+  ports:
+  - port: 27017
+    targetPort: 27017
+  selector:
+    app: mailhog-mongo
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mailhog
+  namespace: mailhog
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # For WebSocket support
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: mailhog.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mailhog
+            port:
+              name: http
+  tls:
+  - hosts:
+    - mailhog.example.com
+    secretName: mailhog-tls
+
+---
+# HorizontalPodAutoscaler for MailHog
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mailhog
+  namespace: mailhog
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mailhog
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# NetworkPolicy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mailhog-network-policy
+  namespace: mailhog
+spec:
+  podSelector:
+    matchLabels:
+      app: mailhog
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 1025
+    - protocol: TCP
+      port: 8025
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: mailhog-mongo
+    ports:
+    - protocol: TCP
+      port: 27017
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+
+---
+# ServiceMonitor for Prometheus monitoring (optional)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mailhog
+  namespace: mailhog
+  labels:
+    app: mailhog
+spec:
+  selector:
+    matchLabels:
+      app: mailhog
+  endpoints:
+  - port: http
+    path: /api/v2/messages
+    interval: 30s

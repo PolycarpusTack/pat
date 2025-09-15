@@ -1,0 +1,456 @@
+# =============================================================================
+# Pat Fortress Backup and Disaster Recovery Configuration
+# =============================================================================
+# This configuration defines backup policies, retention schedules, and 
+# recovery parameters for the Pat Fortress platform
+# =============================================================================
+
+# General Configuration
+general:
+  version: "2.0.0"
+  environment: "production"
+  platform_name: "pat-fortress"
+  backup_base_path: "/var/lib/fortress/backups"
+  temp_work_path: "/tmp/fortress-backup-work"
+  
+# Backup Schedules
+schedules:
+  # High-frequency backups for immediate recovery
+  high_frequency:
+    database_wal:
+      interval: "continuous"
+      method: "streaming"
+      retention_hours: 24
+      compression: "gzip"
+      encryption: true
+    
+    database_snapshots:
+      interval: "*/15 * * * *"  # Every 15 minutes
+      method: "pg_dump"
+      retention_hours: 24
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+    
+    redis_snapshots:
+      interval: "*/5 * * * *"   # Every 5 minutes
+      method: "bgsave"
+      retention_hours: 24
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+    
+    configuration_backup:
+      trigger: "on_change"
+      method: "rsync"
+      retention_hours: 168  # 7 days
+      versioning: true
+      encryption: true
+  
+  # Medium-frequency backups for regional protection
+  medium_frequency:
+    database_full:
+      interval: "0 */4 * * *"   # Every 4 hours
+      method: "pg_basebackup"
+      retention_days: 30
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+    
+    incremental_backup:
+      interval: "0 * * * *"     # Every hour
+      method: "rsync"
+      retention_days: 7
+      compression: "zstd"
+      encryption: true
+    
+    application_data:
+      interval: "0 */6 * * *"   # Every 6 hours
+      method: "tar"
+      retention_days: 30
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+    
+    logs_archive:
+      interval: "0 2 * * *"     # Daily at 2 AM
+      method: "tar"
+      retention_days: 30
+      compression: "zstd"
+      encryption: true
+  
+  # Low-frequency backups for long-term retention
+  low_frequency:
+    weekly_full:
+      interval: "0 1 * * 0"     # Weekly on Sunday at 1 AM
+      method: "full_system"
+      retention_weeks: 52
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+    
+    monthly_archive:
+      interval: "0 3 1 * *"     # Monthly on 1st at 3 AM
+      method: "full_system"
+      retention_months: 12
+      compression: "zstd"
+      compression_level: 19
+      encryption: true
+
+# Storage Tiers
+storage_tiers:
+  # Tier 1: Local high-speed storage
+  local:
+    type: "local_nvme"
+    path: "/var/lib/fortress/backups/local"
+    max_size: "500GB"
+    cleanup_threshold: 85
+    retention:
+      database_snapshots: "24h"
+      redis_snapshots: "24h"
+      wal_archives: "24h"
+      configurations: "168h"  # 7 days
+  
+  # Tier 2: Remote geographic storage
+  remote:
+    type: "remote_server"
+    enabled: true
+    host: "${REMOTE_BACKUP_HOST}"
+    port: 22
+    user: "${REMOTE_BACKUP_USER}"
+    path: "${REMOTE_BACKUP_PATH}"
+    ssh_key: "/etc/fortress/ssh/backup_key"
+    max_size: "2TB"
+    retention:
+      database_full: "30d"
+      incremental: "7d"
+      application_data: "30d"
+      logs: "30d"
+  
+  # Tier 3: Cloud long-term storage
+  cloud:
+    aws_s3:
+      enabled: true
+      bucket: "${AWS_S3_BACKUP_BUCKET}"
+      region: "${AWS_S3_BACKUP_REGION}"
+      storage_class: "STANDARD_IA"
+      encryption: "AES256"
+      lifecycle_policy: "glacier_after_90d"
+      retention:
+        weekly_full: "52w"
+        monthly_archive: "12m"
+    
+    gcs:
+      enabled: true
+      bucket: "${GCS_BACKUP_BUCKET}"
+      region: "${GCS_BACKUP_REGION}"
+      storage_class: "NEARLINE"
+      retention:
+        weekly_full: "52w"
+        monthly_archive: "12m"
+
+# Database Backup Configuration
+database:
+  postgresql:
+    connection:
+      host: "fortress-postgres-primary"
+      port: 5432
+      database: "${POSTGRES_DB}"
+      user: "${POSTGRES_USER}"
+      password_file: "/run/secrets/postgres_password"
+    
+    backup_options:
+      format: "custom"
+      compress: false  # We compress separately for better control
+      no_privileges: true
+      no_owner: true
+      verbose: true
+      
+    wal_archiving:
+      enabled: true
+      archive_command: "/usr/local/bin/wal-archive.sh %f %p"
+      archive_mode: "on"
+      max_wal_size: "2GB"
+      checkpoint_completion_target: 0.7
+    
+    point_in_time_recovery:
+      enabled: true
+      granularity: "1s"
+      max_recovery_lag: "300s"  # 5 minutes
+  
+  redis:
+    connection:
+      host: "fortress-redis-master"
+      port: 6379
+      password_file: "/run/secrets/redis_password"
+      database: 0
+    
+    backup_options:
+      rdb_snapshots: true
+      aof_persistence: true
+      aof_rewrite_percentage: 100
+      aof_rewrite_min_size: "64mb"
+    
+    replication:
+      enabled: true
+      replica_host: "fortress-redis-replica"
+      replica_lag_threshold: "1s"
+
+# Application Data Backup
+application:
+  data_directories:
+    - path: "/var/lib/fortress/app/storage"
+      type: "email_storage"
+      critical: true
+      backup_frequency: "high"
+    
+    - path: "/var/lib/fortress/app/emails"
+      type: "email_data"
+      critical: true
+      backup_frequency: "high"
+    
+    - path: "/var/lib/fortress/app/plugins"
+      type: "plugin_storage"
+      critical: false
+      backup_frequency: "medium"
+    
+    - path: "/var/lib/fortress/app/workflows"
+      type: "workflow_definitions"
+      critical: true
+      backup_frequency: "medium"
+    
+    - path: "/var/lib/fortress/app/workflow-state"
+      type: "workflow_state"
+      critical: true
+      backup_frequency: "high"
+  
+  configuration_files:
+    - path: "/mnt/c/Projects/Pat/docker-compose.fortress.yml"
+      type: "docker_compose"
+      critical: true
+    
+    - path: "/mnt/c/Projects/Pat/k8s/"
+      type: "kubernetes_manifests"
+      critical: true
+    
+    - path: "/mnt/c/Projects/Pat/monitoring/"
+      type: "monitoring_config"
+      critical: true
+    
+    - path: "/mnt/c/Projects/Pat/nginx/"
+      type: "reverse_proxy_config"
+      critical: true
+    
+    - path: "/mnt/c/Projects/Pat/terraform/"
+      type: "infrastructure_code"
+      critical: true
+
+# Security and Encryption
+security:
+  encryption:
+    enabled: true
+    algorithm: "AES-256-GCM"
+    key_derivation: "PBKDF2"
+    key_iterations: 100000
+    
+    gpg_configuration:
+      recipient_key: "${BACKUP_ENCRYPTION_KEY}"
+      armor_output: false
+      compression_algorithm: "ZLIB"
+      cipher_algorithm: "AES256"
+  
+  secrets_backup:
+    vault_integration: true
+    rotation_schedule: "0 0 1 * *"  # Monthly
+    backup_sealed_only: true
+    encryption_required: true
+  
+  access_control:
+    backup_user: "fortress-backup"
+    backup_group: "fortress-backup"
+    permissions: "0600"
+    audit_logging: true
+
+# Monitoring and Alerting
+monitoring:
+  metrics:
+    enabled: true
+    retention: "90d"
+    export_format: "json"
+    export_interval: "5m"
+    
+    collected_metrics:
+      - backup_duration_seconds
+      - backup_size_bytes
+      - backup_success_rate
+      - recovery_time_seconds
+      - storage_usage_bytes
+      - replication_lag_seconds
+  
+  alerting:
+    enabled: true
+    channels:
+      - type: "email"
+        recipients: ["${ALERT_EMAIL}"]
+      - type: "slack"
+        webhook: "${SLACK_WEBHOOK_URL}"
+      - type: "pagerduty"
+        integration_key: "${PAGERDUTY_INTEGRATION_KEY}"
+    
+    alert_conditions:
+      backup_failure:
+        threshold: 1
+        duration: "5m"
+        severity: "critical"
+      
+      backup_duration_high:
+        threshold: "30m"
+        duration: "5m"
+        severity: "warning"
+      
+      storage_usage_high:
+        threshold: 85  # percent
+        duration: "15m"
+        severity: "warning"
+      
+      replication_lag_high:
+        threshold: "300s"
+        duration: "5m"
+        severity: "critical"
+
+# Recovery Configuration
+recovery:
+  rto_targets:
+    critical_services: "300s"     # 5 minutes
+    supporting_services: "600s"   # 10 minutes
+    full_system: "900s"          # 15 minutes
+  
+  rpo_targets:
+    database_transactions: "60s"  # 1 minute
+    configuration_changes: "300s" # 5 minutes
+    log_data: "300s"             # 5 minutes
+    file_uploads: "300s"         # 5 minutes
+  
+  scenarios:
+    service_failure:
+      detection_time: "30s"
+      response_time: "120s"
+      recovery_method: "service_restart"
+      validation_required: true
+    
+    database_corruption:
+      detection_time: "120s"
+      response_time: "300s"
+      recovery_method: "pitr_restore"
+      validation_required: true
+    
+    infrastructure_failure:
+      detection_time: "60s"
+      response_time: "900s"
+      recovery_method: "full_rebuild"
+      validation_required: true
+    
+    regional_disaster:
+      detection_time: "300s"
+      response_time: "600s"
+      recovery_method: "cross_region_failover"
+      validation_required: true
+    
+    security_breach:
+      detection_time: "120s"
+      response_time: "1200s"
+      recovery_method: "clean_slate_rebuild"
+      validation_required: true
+
+# Testing and Validation
+testing:
+  automated_testing:
+    enabled: true
+    schedule:
+      backup_integrity: "0 */6 * * *"    # Every 6 hours
+      recovery_simulation: "0 2 * * 0"   # Weekly
+      cross_region_failover: "0 3 1 * *" # Monthly
+    
+    test_environments:
+      staging:
+        enabled: true
+        restore_frequency: "daily"
+        validation_tests: ["connectivity", "data_integrity", "performance"]
+      
+      disaster_recovery:
+        enabled: true
+        restore_frequency: "weekly"
+        validation_tests: ["full_recovery", "rto_validation", "rpo_validation"]
+  
+  validation_procedures:
+    backup_verification:
+      - checksum_validation
+      - archive_integrity_check
+      - restoration_test
+      - data_consistency_check
+    
+    recovery_verification:
+      - service_health_check
+      - database_connectivity
+      - api_functionality
+      - performance_baseline
+      - security_validation
+
+# Compliance and Governance
+compliance:
+  regulations:
+    gdpr:
+      enabled: true
+      data_retention: "6y"
+      deletion_procedures: true
+      audit_trail: true
+    
+    hipaa:
+      enabled: false
+      encryption_required: true
+      access_logging: true
+    
+    sox:
+      enabled: false
+      financial_data_retention: "7y"
+      change_control: true
+  
+  audit:
+    enabled: true
+    retention: "7y"
+    log_format: "json"
+    
+    audit_events:
+      - backup_operations
+      - recovery_operations
+      - configuration_changes
+      - access_events
+      - security_events
+    
+    reporting:
+      frequency: "monthly"
+      recipients: ["${COMPLIANCE_EMAIL}"]
+      format: "pdf"
+
+# Performance Optimization
+performance:
+  backup_optimization:
+    parallel_jobs: 4
+    compression_threads: 0  # Use all available
+    network_bandwidth_limit: "100MB/s"
+    io_priority: "best_effort"
+    nice_level: 10
+  
+  storage_optimization:
+    deduplication: true
+    compression_ratio_target: 0.7
+    cleanup_frequency: "daily"
+    space_reclaim_threshold: 80
+  
+  network_optimization:
+    tcp_window_scaling: true
+    buffer_sizes:
+      send: "16MB"
+      receive: "16MB"
+    connection_pooling: true
+    keep_alive: true

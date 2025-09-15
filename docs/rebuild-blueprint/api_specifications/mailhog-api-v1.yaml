@@ -1,0 +1,311 @@
+openapi: 3.0.0
+info:
+  title: MailHog API v1
+  version: 1.0.0
+  description: |
+    RESTful HTTP JSON API for MailHog email testing tool.
+    This is the frozen v1 API - no new features will be added.
+
+servers:
+  - url: http://localhost:8025
+    description: Default local server
+
+security:
+  - basicAuth: []
+  - {}
+
+paths:
+  /api/v1/events:
+    get:
+      summary: Stream new messages
+      description: |
+        Streams new messages using Server-Sent Events (SSE) with chunked encoding.
+        Clients should handle automatic reconnection.
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: message
+                  data: {"Id":"id","From":{"Address":"sender@example.com"},"To":[{"Address":"recipient@example.com"}],"Created":"2025-06-11T10:30:00Z"}
+
+  /api/v1/messages:
+    get:
+      summary: List all messages
+      description: Lists all messages excluding message content for performance
+      responses:
+        '200':
+          description: Message list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                    description: Total number of messages
+                  count:
+                    type: integer
+                    description: Number of messages returned
+                  messages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MessageSummary'
+    
+    delete:
+      summary: Delete all messages
+      description: Removes all stored messages
+      responses:
+        '200':
+          description: All messages deleted successfully
+
+  /api/v1/messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+    
+    get:
+      summary: Get message details
+      description: Returns an individual message including full content
+      responses:
+        '200':
+          description: Message details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '404':
+          description: Message not found
+    
+    delete:
+      summary: Delete message
+      description: Delete an individual message
+      responses:
+        '200':
+          description: Message deleted successfully
+        '404':
+          description: Message not found
+
+  /api/v1/messages/{id}/download:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+    
+    get:
+      summary: Download message
+      description: Download the complete message as .eml file
+      responses:
+        '200':
+          description: Message file
+          content:
+            message/rfc822:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename="message.eml"
+        '404':
+          description: Message not found
+
+  /api/v1/messages/{id}/mime/part/{partIndex}/download:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+      - name: partIndex
+        in: path
+        required: true
+        description: MIME part index
+        schema:
+          type: integer
+    
+    get:
+      summary: Download MIME part
+      description: Download a specific MIME part/attachment
+      responses:
+        '200':
+          description: MIME part content
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Message or part not found
+
+  /api/v1/messages/{id}/release:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ID
+        schema:
+          type: string
+    
+    post:
+      summary: Release message
+      description: Forward the message to a real SMTP server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - Host
+                - Port
+                - Email
+              properties:
+                Host:
+                  type: string
+                  description: SMTP server hostname
+                  example: mail.example.com
+                Port:
+                  type: string
+                  description: SMTP server port
+                  example: "25"
+                Email:
+                  type: string
+                  description: Recipient email address
+                  example: someone@example.com
+                Username:
+                  type: string
+                  description: SMTP authentication username
+                Password:
+                  type: string
+                  description: SMTP authentication password
+                Mechanism:
+                  type: string
+                  description: SMTP auth mechanism
+                  enum: [PLAIN, CRAM-MD5]
+      responses:
+        '200':
+          description: Message released successfully
+        '404':
+          description: Message not found
+        '500':
+          description: SMTP delivery failed
+
+components:
+  schemas:
+    MessageSummary:
+      type: object
+      properties:
+        ID:
+          type: string
+          description: Unique message identifier
+        From:
+          $ref: '#/components/schemas/Path'
+        To:
+          type: array
+          items:
+            $ref: '#/components/schemas/Path'
+        Content:
+          $ref: '#/components/schemas/ContentSummary'
+        Created:
+          type: string
+          format: date-time
+          description: Message creation timestamp
+    
+    Message:
+      allOf:
+        - $ref: '#/components/schemas/MessageSummary'
+        - type: object
+          properties:
+            MIME:
+              $ref: '#/components/schemas/MIMEBody'
+            Raw:
+              type: object
+              properties:
+                From:
+                  type: string
+                To:
+                  type: array
+                  items:
+                    type: string
+                Data:
+                  type: string
+                  description: Raw message data
+    
+    Path:
+      type: object
+      properties:
+        Relays:
+          type: array
+          items:
+            type: string
+          nullable: true
+        Mailbox:
+          type: string
+        Domain:
+          type: string
+        Params:
+          type: string
+        Address:
+          type: string
+          description: Full email address
+        Name:
+          type: string
+          description: Display name
+    
+    ContentSummary:
+      type: object
+      properties:
+        Headers:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        Body:
+          type: string
+          description: Plain text body preview
+        Size:
+          type: integer
+          description: Total message size in bytes
+    
+    MIMEBody:
+      type: object
+      properties:
+        Parts:
+          type: array
+          items:
+            type: object
+            properties:
+              Headers:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    type: string
+              Body:
+                type: string
+              Size:
+                type: integer
+              ContentType:
+                type: string
+              FileName:
+                type: string
+
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Optional HTTP Basic Authentication

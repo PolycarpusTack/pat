@@ -1,0 +1,407 @@
+# =============================================================================
+# Pat Fortress - PostgreSQL Custom Queries for Prometheus Exporter
+# Custom metrics for Fortress database monitoring
+# =============================================================================
+
+# =============================================================================
+# Email Processing Metrics
+# =============================================================================
+
+fortress_emails_by_status:
+  query: |
+    SELECT 
+      status,
+      COUNT(*) as count
+    FROM emails 
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY status
+  metrics:
+    - count:
+        usage: "GAUGE"
+        description: "Number of emails by status in the last 24 hours"
+  master: true
+  cache_seconds: 30
+
+fortress_email_processing_time:
+  query: |
+    SELECT 
+      'email_processing' as metric,
+      AVG(EXTRACT(EPOCH FROM (processed_at - created_at))) as avg_seconds,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (processed_at - created_at))) as median_seconds,
+      PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (processed_at - created_at))) as p95_seconds
+    FROM emails 
+    WHERE processed_at IS NOT NULL 
+      AND created_at > NOW() - INTERVAL '1 hour'
+  metrics:
+    - avg_seconds:
+        usage: "GAUGE"
+        description: "Average email processing time in seconds"
+    - median_seconds:
+        usage: "GAUGE" 
+        description: "Median email processing time in seconds"
+    - p95_seconds:
+        usage: "GAUGE"
+        description: "95th percentile email processing time in seconds"
+  master: true
+  cache_seconds: 60
+
+fortress_email_queue_depth:
+  query: |
+    SELECT 
+      queue_name,
+      COUNT(*) as depth
+    FROM email_queue 
+    WHERE status = 'pending'
+    GROUP BY queue_name
+  metrics:
+    - depth:
+        usage: "GAUGE"
+        description: "Current email queue depth by queue name"
+  master: true
+  cache_seconds: 15
+
+# =============================================================================
+# User and Session Metrics
+# =============================================================================
+
+fortress_active_sessions:
+  query: |
+    SELECT 
+      'active_sessions' as metric,
+      COUNT(*) as count
+    FROM user_sessions 
+    WHERE expires_at > NOW() 
+      AND last_activity > NOW() - INTERVAL '30 minutes'
+  metrics:
+    - count:
+        usage: "GAUGE"
+        description: "Number of currently active user sessions"
+  master: true
+  cache_seconds: 30
+
+fortress_user_activity:
+  query: |
+    SELECT 
+      DATE_TRUNC('hour', created_at) as hour,
+      COUNT(*) as login_count,
+      COUNT(DISTINCT user_id) as unique_users
+    FROM user_sessions 
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY DATE_TRUNC('hour', created_at)
+    ORDER BY hour DESC
+    LIMIT 24
+  metrics:
+    - login_count:
+        usage: "GAUGE"
+        description: "Number of logins per hour"
+    - unique_users:
+        usage: "GAUGE" 
+        description: "Number of unique users per hour"
+  master: true
+  cache_seconds: 300
+
+fortress_failed_logins:
+  query: |
+    SELECT 
+      source_ip,
+      COUNT(*) as failed_attempts
+    FROM auth_logs 
+    WHERE result = 'failed' 
+      AND created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY source_ip
+    HAVING COUNT(*) > 5
+  metrics:
+    - failed_attempts:
+        usage: "GAUGE"
+        description: "Failed login attempts by IP in the last hour"
+  master: true
+  cache_seconds: 60
+
+# =============================================================================
+# Plugin and Workflow Metrics
+# =============================================================================
+
+fortress_plugin_executions:
+  query: |
+    SELECT 
+      plugin_name,
+      plugin_version,
+      status,
+      COUNT(*) as execution_count,
+      AVG(execution_time_ms) as avg_execution_time,
+      MAX(execution_time_ms) as max_execution_time
+    FROM plugin_executions 
+    WHERE created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY plugin_name, plugin_version, status
+  metrics:
+    - execution_count:
+        usage: "GAUGE"
+        description: "Plugin execution count by name, version, and status"
+    - avg_execution_time:
+        usage: "GAUGE"
+        description: "Average plugin execution time in milliseconds"
+    - max_execution_time:
+        usage: "GAUGE"
+        description: "Maximum plugin execution time in milliseconds"
+  master: true
+  cache_seconds: 60
+
+fortress_workflow_status:
+  query: |
+    SELECT 
+      workflow_name,
+      status,
+      COUNT(*) as workflow_count
+    FROM workflow_executions 
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY workflow_name, status
+  metrics:
+    - workflow_count:
+        usage: "GAUGE"
+        description: "Workflow execution count by name and status in the last 24 hours"
+  master: true
+  cache_seconds: 120
+
+fortress_workflow_step_failures:
+  query: |
+    SELECT 
+      workflow_name,
+      step_name,
+      COUNT(*) as failure_count
+    FROM workflow_step_logs 
+    WHERE status = 'failed' 
+      AND created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY workflow_name, step_name
+  metrics:
+    - failure_count:
+        usage: "GAUGE"
+        description: "Workflow step failure count by workflow and step name"
+  master: true
+  cache_seconds: 60
+
+# =============================================================================
+# Storage and Resource Metrics
+# =============================================================================
+
+fortress_storage_usage:
+  query: |
+    SELECT 
+      'email_storage' as storage_type,
+      SUM(size_bytes) as used_bytes,
+      COUNT(*) as email_count
+    FROM emails 
+    WHERE deleted_at IS NULL
+    UNION ALL
+    SELECT 
+      'attachment_storage' as storage_type,
+      SUM(size_bytes) as used_bytes,
+      COUNT(*) as attachment_count
+    FROM email_attachments 
+    WHERE deleted_at IS NULL
+  metrics:
+    - used_bytes:
+        usage: "GAUGE"
+        description: "Storage space used in bytes by storage type"
+    - email_count:
+        usage: "GAUGE"
+        description: "Number of items in storage by storage type"
+  master: true
+  cache_seconds: 300
+
+fortress_database_table_sizes:
+  query: |
+    SELECT 
+      schemaname as schema_name,
+      tablename as table_name,
+      pg_total_relation_size(schemaname||'.'||tablename) as size_bytes,
+      n_tup_ins as inserts,
+      n_tup_upd as updates,
+      n_tup_del as deletes
+    FROM pg_stat_user_tables 
+    WHERE schemaname = 'public'
+      AND tablename IN ('emails', 'email_attachments', 'user_sessions', 'plugin_executions', 'workflow_executions')
+  metrics:
+    - size_bytes:
+        usage: "GAUGE"
+        description: "Table size in bytes"
+    - inserts:
+        usage: "COUNTER"
+        description: "Number of tuples inserted"
+    - updates:
+        usage: "COUNTER"
+        description: "Number of tuples updated"
+    - deletes:
+        usage: "COUNTER"
+        description: "Number of tuples deleted"
+  master: true
+  cache_seconds: 300
+
+# =============================================================================
+# Performance and Health Metrics
+# =============================================================================
+
+fortress_slow_queries:
+  query: |
+    SELECT 
+      query,
+      calls,
+      total_time,
+      mean_time,
+      max_time
+    FROM pg_stat_statements 
+    WHERE mean_time > 1000  -- Queries taking more than 1 second on average
+    ORDER BY mean_time DESC
+    LIMIT 10
+  metrics:
+    - calls:
+        usage: "GAUGE"
+        description: "Number of times the query has been executed"
+    - total_time:
+        usage: "GAUGE"
+        description: "Total time spent executing the query"
+    - mean_time:
+        usage: "GAUGE"
+        description: "Mean execution time for the query"
+    - max_time:
+        usage: "GAUGE"
+        description: "Maximum execution time for the query"
+  master: true
+  cache_seconds: 300
+
+fortress_connection_stats:
+  query: |
+    SELECT 
+      state,
+      COUNT(*) as connection_count,
+      COALESCE(client_addr::text, 'local') as client_type
+    FROM pg_stat_activity 
+    WHERE datname = current_database()
+    GROUP BY state, COALESCE(client_addr::text, 'local')
+  metrics:
+    - connection_count:
+        usage: "GAUGE"
+        description: "Database connections by state and client type"
+  master: true
+  cache_seconds: 30
+
+fortress_replication_lag:
+  query: |
+    SELECT 
+      client_addr,
+      state,
+      EXTRACT(EPOCH FROM (now() - backend_start)) as connection_age_seconds,
+      CASE 
+        WHEN pg_is_in_recovery() THEN 
+          EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))
+        ELSE 0 
+      END as lag_seconds
+    FROM pg_stat_replication
+  metrics:
+    - connection_age_seconds:
+        usage: "GAUGE"
+        description: "Age of replication connection in seconds"
+    - lag_seconds:
+        usage: "GAUGE"
+        description: "Replication lag in seconds"
+  master: true
+  cache_seconds: 30
+
+# =============================================================================
+# Security and Audit Metrics
+# =============================================================================
+
+fortress_security_events:
+  query: |
+    SELECT 
+      event_type,
+      severity,
+      COUNT(*) as event_count
+    FROM security_events 
+    WHERE created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY event_type, severity
+  metrics:
+    - event_count:
+        usage: "GAUGE"
+        description: "Security events by type and severity in the last hour"
+  master: true
+  cache_seconds: 60
+
+fortress_blocked_ips:
+  query: |
+    SELECT 
+      reason,
+      COUNT(*) as blocked_count,
+      COUNT(DISTINCT ip_address) as unique_ips
+    FROM blocked_ips 
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+      AND expires_at > NOW()
+    GROUP BY reason
+  metrics:
+    - blocked_count:
+        usage: "GAUGE"
+        description: "Number of IP blocking events by reason"
+    - unique_ips:
+        usage: "GAUGE"
+        description: "Number of unique blocked IPs by reason"
+  master: true
+  cache_seconds: 120
+
+fortress_api_rate_limits:
+  query: |
+    SELECT 
+      endpoint,
+      ip_address,
+      COUNT(*) as rate_limit_hits
+    FROM api_rate_limits 
+    WHERE created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY endpoint, ip_address
+    HAVING COUNT(*) > 10
+  metrics:
+    - rate_limit_hits:
+        usage: "GAUGE"
+        description: "API rate limit hits by endpoint and IP"
+  master: true
+  cache_seconds: 60
+
+# =============================================================================
+# Business Intelligence Metrics
+# =============================================================================
+
+fortress_email_categories:
+  query: |
+    SELECT 
+      COALESCE(category, 'uncategorized') as category,
+      COUNT(*) as email_count,
+      AVG(size_bytes) as avg_size
+    FROM emails 
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY category
+  metrics:
+    - email_count:
+        usage: "GAUGE"
+        description: "Number of emails by category in the last 24 hours"
+    - avg_size:
+        usage: "GAUGE"
+        description: "Average email size by category"
+  master: true
+  cache_seconds: 300
+
+fortress_user_engagement:
+  query: |
+    SELECT 
+      DATE_TRUNC('day', last_activity) as activity_date,
+      COUNT(DISTINCT user_id) as active_users,
+      COUNT(*) as total_sessions
+    FROM user_sessions 
+    WHERE last_activity > NOW() - INTERVAL '7 days'
+    GROUP BY DATE_TRUNC('day', last_activity)
+    ORDER BY activity_date DESC
+  metrics:
+    - active_users:
+        usage: "GAUGE"
+        description: "Number of active users per day"
+    - total_sessions:
+        usage: "GAUGE"
+        description: "Total sessions per day"
+  master: true
+  cache_seconds: 3600

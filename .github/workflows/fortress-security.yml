@@ -1,0 +1,1005 @@
+name: 🛡️ Fortress Security Validation Pipeline
+
+on:
+  push:
+    branches: [main, develop, feature/*, security/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run security scans daily at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of security scan to run'
+        required: true
+        type: choice
+        options:
+          - full
+          - sast
+          - dast
+          - dependency
+          - container
+          - infrastructure
+        default: 'full'
+      severity_threshold:
+        description: 'Minimum severity to fail on'
+        required: false
+        type: choice
+        options:
+          - critical
+          - high
+          - medium
+          - low
+        default: 'high'
+
+env:
+  NODE_VERSION: '18'
+  GO_VERSION: '1.21'
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: pat-fortress
+  
+  # Security thresholds
+  MAX_CRITICAL_VULNERABILITIES: 0
+  MAX_HIGH_VULNERABILITIES: 0
+  MAX_MEDIUM_VULNERABILITIES: 5
+  MIN_SECURITY_SCORE: 85
+  
+  # Security tools
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  AQUA_KEY: ${{ secrets.AQUA_KEY }}
+  OWASP_ZAP_VERSION: 2.14.0
+
+jobs:
+  # ===== STATIC APPLICATION SECURITY TESTING (SAST) =====
+  sast-analysis:
+    name: 🔍 Static Application Security Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: inputs.scan_type == 'full' || inputs.scan_type == 'sast' || github.event_name != 'workflow_dispatch'
+    
+    outputs:
+      sast-results: ${{ steps.sast-results.outputs.results }}
+      security-score: ${{ steps.security-score.outputs.score }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📥 Install Dependencies
+        run: |
+          go mod download
+          cd frontend && npm ci --prefer-offline
+          
+      - name: 🔍 CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go, javascript
+          config-file: ./.github/codeql/codeql-security-config.yml
+          queries: +security-and-quality,security-experimental
+          
+      - name: 🔍 CodeQL Autobuild
+        uses: github/codeql-action/autobuild@v3
+        
+      - name: 🔍 CodeQL Security Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go,javascript"
+          output: codeql-results
+          upload: true
+          
+      - name: 🔍 Semgrep SAST Scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/golang
+            p/typescript
+            p/react
+            p/docker
+            r/go.lang.security
+            r/javascript.lang.security
+          generateSarif: "1"
+          
+      - name: 📊 Upload Semgrep Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          
+      - name: 🔍 Gosec Go Security Scanner
+        run: |
+          go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+          gosec -fmt sarif -out gosec-report.sarif -stdout -verbose ./...
+          
+      - name: 📊 Upload Gosec Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gosec-report.sarif
+          
+      - name: 🔍 ESLint Security Scan
+        working-directory: frontend
+        run: |
+          npx eslint . --ext .js,.jsx,.ts,.tsx --format @microsoft/eslint-formatter-sarif --output-file eslint-security.sarif
+          
+      - name: 📊 Upload ESLint Security Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: frontend/eslint-security.sarif
+          
+      - name: 🔍 Secrets Detection with TruffleHog
+        run: |
+          docker run --rm -v "$PWD:/pwd" trufflesecurity/trufflehog:latest filesystem /pwd --json > secrets-scan.json
+          
+          # Check for secrets
+          SECRET_COUNT=$(jq length secrets-scan.json)
+          if [ "$SECRET_COUNT" -gt 0 ]; then
+            echo "🚨 Secrets detected: $SECRET_COUNT"
+            jq '.' secrets-scan.json
+            echo "SECRETS_FOUND=true" >> $GITHUB_ENV
+          else
+            echo "✅ No secrets detected"
+            echo "SECRETS_FOUND=false" >> $GITHUB_ENV
+          fi
+          
+      - name: 🔍 License Compliance Check
+        run: |
+          go install github.com/fossa-contrib/fossa-cli@latest
+          
+          # Scan Go dependencies
+          fossa analyze --debug
+          fossa test --debug || echo "License issues detected"
+          
+          # Scan NPM dependencies
+          cd frontend
+          npx license-checker --json --out ../license-report.json
+          
+      - name: 📊 Aggregate SAST Results
+        id: sast-results
+        run: |
+          mkdir -p security-reports
+          
+          # Aggregate all SARIF results
+          echo "Aggregating SAST results..."
+          
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          MEDIUM_COUNT=0
+          LOW_COUNT=0
+          
+          # Count vulnerabilities from all SARIF files
+          for sarif_file in *.sarif frontend/*.sarif; do
+            if [ -f "$sarif_file" ]; then
+              # Extract vulnerability counts (simplified logic)
+              CRITICAL_COUNT=$((CRITICAL_COUNT + $(jq '.runs[].results[] | select(.level == "error") | select(.ruleId | contains("security"))' "$sarif_file" 2>/dev/null | wc -l || echo "0")))
+              HIGH_COUNT=$((HIGH_COUNT + $(jq '.runs[].results[] | select(.level == "warning") | select(.ruleId | contains("security"))' "$sarif_file" 2>/dev/null | wc -l || echo "0")))
+            fi
+          done
+          
+          echo "SAST Results:"
+          echo "Critical: $CRITICAL_COUNT"
+          echo "High: $HIGH_COUNT"
+          echo "Medium: $MEDIUM_COUNT"
+          echo "Low: $LOW_COUNT"
+          
+          # Generate summary
+          cat > security-reports/sast-summary.json << EOF
+          {
+            "scan_type": "SAST",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "vulnerabilities": {
+              "critical": $CRITICAL_COUNT,
+              "high": $HIGH_COUNT,
+              "medium": $MEDIUM_COUNT,
+              "low": $LOW_COUNT
+            },
+            "secrets_found": ${{ env.SECRETS_FOUND }}
+          }
+          EOF
+          
+          echo "results=$(cat security-reports/sast-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📊 Calculate Security Score
+        id: security-score
+        run: |
+          # Calculate security score based on vulnerabilities
+          CRITICAL_COUNT=$(jq '.vulnerabilities.critical' security-reports/sast-summary.json)
+          HIGH_COUNT=$(jq '.vulnerabilities.high' security-reports/sast-summary.json)
+          MEDIUM_COUNT=$(jq '.vulnerabilities.medium' security-reports/sast-summary.json)
+          SECRETS_FOUND=$(jq '.secrets_found' security-reports/sast-summary.json)
+          
+          # Base score starts at 100
+          SCORE=100
+          
+          # Deduct points for vulnerabilities
+          SCORE=$((SCORE - (CRITICAL_COUNT * 20)))
+          SCORE=$((SCORE - (HIGH_COUNT * 10)))
+          SCORE=$((SCORE - (MEDIUM_COUNT * 2)))
+          
+          # Deduct points for secrets
+          if [ "$SECRETS_FOUND" = "true" ]; then
+            SCORE=$((SCORE - 25))
+          fi
+          
+          # Ensure score doesn't go below 0
+          if [ $SCORE -lt 0 ]; then
+            SCORE=0
+          fi
+          
+          echo "Security Score: $SCORE"
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload SAST Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results-${{ github.sha }}
+          path: |
+            security-reports/
+            *.sarif
+            frontend/*.sarif
+            secrets-scan.json
+            license-report.json
+
+  # ===== DEPENDENCY SECURITY SCANNING =====
+  dependency-scan:
+    name: 📦 Dependency Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: inputs.scan_type == 'full' || inputs.scan_type == 'dependency' || github.event_name != 'workflow_dispatch'
+    
+    outputs:
+      dependency-results: ${{ steps.dependency-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 🔍 Go Vulnerability Check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -json ./... > go-vulncheck.json || true
+          
+      - name: 🔍 Snyk Go Dependency Scan
+        uses: snyk/actions/golang@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=medium --json-file-output=snyk-go.json
+          
+      - name: 🔍 NPM Audit
+        working-directory: frontend
+        run: |
+          npm audit --json > ../npm-audit.json || true
+          
+      - name: 🔍 Snyk NPM Dependency Scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=medium --json-file-output=snyk-npm.json
+          command: test
+          
+      - name: 🔍 OWASP Dependency Check
+        run: |
+          # Download and setup OWASP Dependency Check
+          wget -O dependency-check.zip https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.0/dependency-check-8.4.0-release.zip
+          unzip dependency-check.zip
+          
+          # Run dependency check on both Go and NPM projects
+          ./dependency-check/bin/dependency-check.sh \
+            --project "Pat Fortress" \
+            --scan . \
+            --format JSON \
+            --out dependency-check-report.json \
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+            
+      - name: 🔍 Retire.js Scan (JavaScript)
+        working-directory: frontend
+        run: |
+          npx retire --outputformat json --outputpath ../retire-js.json --path .
+          
+      - name: 📊 Aggregate Dependency Results
+        id: dependency-results
+        run: |
+          mkdir -p security-reports
+          
+          echo "Aggregating dependency scan results..."
+          
+          CRITICAL_DEPS=0
+          HIGH_DEPS=0
+          MEDIUM_DEPS=0
+          
+          # Count vulnerabilities from Go
+          if [ -f "go-vulncheck.json" ]; then
+            GO_VULNS=$(jq '.vulns | length' go-vulncheck.json 2>/dev/null || echo "0")
+            CRITICAL_DEPS=$((CRITICAL_DEPS + GO_VULNS))
+          fi
+          
+          # Count vulnerabilities from NPM audit
+          if [ -f "npm-audit.json" ]; then
+            NPM_CRITICAL=$(jq '.vulnerabilities.critical // 0' npm-audit.json)
+            NPM_HIGH=$(jq '.vulnerabilities.high // 0' npm-audit.json)
+            NPM_MEDIUM=$(jq '.vulnerabilities.moderate // 0' npm-audit.json)
+            
+            CRITICAL_DEPS=$((CRITICAL_DEPS + NPM_CRITICAL))
+            HIGH_DEPS=$((HIGH_DEPS + NPM_HIGH))
+            MEDIUM_DEPS=$((MEDIUM_DEPS + NPM_MEDIUM))
+          fi
+          
+          # Count from OWASP Dependency Check
+          if [ -f "dependency-check-report.json" ]; then
+            OWASP_CRITICAL=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "CRITICAL")] | length' dependency-check-report.json 2>/dev/null || echo "0")
+            OWASP_HIGH=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "HIGH")] | length' dependency-check-report.json 2>/dev/null || echo "0")
+            OWASP_MEDIUM=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "MEDIUM")] | length' dependency-check-report.json 2>/dev/null || echo "0")
+            
+            CRITICAL_DEPS=$((CRITICAL_DEPS + OWASP_CRITICAL))
+            HIGH_DEPS=$((HIGH_DEPS + OWASP_HIGH))
+            MEDIUM_DEPS=$((MEDIUM_DEPS + OWASP_MEDIUM))
+          fi
+          
+          echo "Dependency Vulnerabilities:"
+          echo "Critical: $CRITICAL_DEPS"
+          echo "High: $HIGH_DEPS"
+          echo "Medium: $MEDIUM_DEPS"
+          
+          # Generate summary
+          cat > security-reports/dependency-summary.json << EOF
+          {
+            "scan_type": "DEPENDENCY",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "vulnerabilities": {
+              "critical": $CRITICAL_DEPS,
+              "high": $HIGH_DEPS,
+              "medium": $MEDIUM_DEPS,
+              "low": 0
+            }
+          }
+          EOF
+          
+          echo "results=$(cat security-reports/dependency-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload Dependency Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results-${{ github.sha }}
+          path: |
+            security-reports/
+            *-audit.json
+            *-vulncheck.json
+            snyk-*.json
+            dependency-check-report.json
+            retire-js.json
+
+  # ===== CONTAINER SECURITY SCANNING =====
+  container-security:
+    name: 🐳 Container Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: inputs.scan_type == 'full' || inputs.scan_type == 'container' || github.event_name != 'workflow_dispatch'
+    
+    outputs:
+      container-results: ${{ steps.container-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: 🐳 Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:security-scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: 🔍 Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:security-scan'
+          format: 'json'
+          output: 'trivy-container.json'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          
+      - name: 🔍 Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-fs.json'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          
+      - name: 🔍 Docker Scout Security Scan
+        if: github.event_name != 'schedule'
+        run: |
+          # Install Docker Scout
+          curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh
+          
+          # Run Docker Scout scan
+          docker scout cves ${{ env.IMAGE_NAME }}:security-scan --format json --output scout-report.json || true
+          
+      - name: 🔍 Grype Container Scan
+        run: |
+          # Install Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          
+          # Scan the Docker image
+          grype ${{ env.IMAGE_NAME }}:security-scan -o json > grype-report.json
+          
+      - name: 🔍 Dockerfile Security Analysis
+        run: |
+          # Install Hadolint
+          docker run --rm -i hadolint/hadolint:latest < Dockerfile > dockerfile-analysis.txt || true
+          
+          # Convert to JSON format
+          cat dockerfile-analysis.txt | jq -Rs 'split("\n") | map(select(length > 0))' > dockerfile-analysis.json
+          
+      - name: 🔍 Container Configuration Analysis
+        run: |
+          # Check for security best practices in Dockerfile
+          cat > container-security-check.sh << 'EOF'
+          #!/bin/bash
+          
+          ISSUES=()
+          
+          # Check if running as root
+          if ! grep -q "USER" Dockerfile; then
+            ISSUES+=("Container runs as root user")
+          fi
+          
+          # Check for secrets in layers
+          if docker history --no-trunc ${{ env.IMAGE_NAME }}:security-scan | grep -i -E "(password|token|key|secret)"; then
+            ISSUES+=("Potential secrets found in image layers")
+          fi
+          
+          # Check for unnecessary packages
+          if docker run --rm ${{ env.IMAGE_NAME }}:security-scan sh -c "which sudo curl wget" | grep -v "not found"; then
+            ISSUES+=("Potentially unnecessary packages installed")
+          fi
+          
+          # Generate report
+          printf '%s\n' "${ISSUES[@]}" | jq -R . | jq -s . > container-config-issues.json
+          EOF
+          
+          chmod +x container-security-check.sh
+          ./container-security-check.sh
+          
+      - name: 📊 Aggregate Container Results
+        id: container-results
+        run: |
+          mkdir -p security-reports
+          
+          echo "Aggregating container security results..."
+          
+          CRITICAL_CONTAINER=0
+          HIGH_CONTAINER=0
+          MEDIUM_CONTAINER=0
+          
+          # Count from Trivy container scan
+          if [ -f "trivy-container.json" ]; then
+            TRIVY_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-container.json 2>/dev/null || echo "0")
+            TRIVY_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-container.json 2>/dev/null || echo "0")
+            TRIVY_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-container.json 2>/dev/null || echo "0")
+            
+            CRITICAL_CONTAINER=$((CRITICAL_CONTAINER + TRIVY_CRITICAL))
+            HIGH_CONTAINER=$((HIGH_CONTAINER + TRIVY_HIGH))
+            MEDIUM_CONTAINER=$((MEDIUM_CONTAINER + TRIVY_MEDIUM))
+          fi
+          
+          # Count from Grype scan
+          if [ -f "grype-report.json" ]; then
+            GRYPE_CRITICAL=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' grype-report.json 2>/dev/null || echo "0")
+            GRYPE_HIGH=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' grype-report.json 2>/dev/null || echo "0")
+            GRYPE_MEDIUM=$(jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length' grype-report.json 2>/dev/null || echo "0")
+            
+            CRITICAL_CONTAINER=$((CRITICAL_CONTAINER + GRYPE_CRITICAL))
+            HIGH_CONTAINER=$((HIGH_CONTAINER + GRYPE_HIGH))
+            MEDIUM_CONTAINER=$((MEDIUM_CONTAINER + GRYPE_MEDIUM))
+          fi
+          
+          echo "Container Security Results:"
+          echo "Critical: $CRITICAL_CONTAINER"
+          echo "High: $HIGH_CONTAINER"
+          echo "Medium: $MEDIUM_CONTAINER"
+          
+          # Generate summary
+          cat > security-reports/container-summary.json << EOF
+          {
+            "scan_type": "CONTAINER",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "vulnerabilities": {
+              "critical": $CRITICAL_CONTAINER,
+              "high": $HIGH_CONTAINER,
+              "medium": $MEDIUM_CONTAINER,
+              "low": 0
+            }
+          }
+          EOF
+          
+          echo "results=$(cat security-reports/container-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📊 Upload Container Security Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-container.sarif
+          
+      - name: 📤 Upload Container Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-scan-results-${{ github.sha }}
+          path: |
+            security-reports/
+            trivy-*.json
+            scout-report.json
+            grype-report.json
+            dockerfile-analysis.json
+            container-config-issues.json
+
+  # ===== DYNAMIC APPLICATION SECURITY TESTING (DAST) =====
+  dast-analysis:
+    name: 🌐 Dynamic Application Security Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: inputs.scan_type == 'full' || inputs.scan_type == 'dast' || github.event_name != 'workflow_dispatch'
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    outputs:
+      dast-results: ${{ steps.dast-results.outputs.results }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🗃️ Setup Database
+        run: |
+          go run ./cmd/migrate up
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_test
+          
+      - name: 🚀 Start Application
+        run: |
+          go mod download
+          go build -o pat-server ./cmd/server
+          
+          # Start the application in background
+          ./pat-server --config=config/test.yml &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:8080/health; do sleep 2; done'
+          
+          echo "Application started successfully"
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_test
+          REDIS_URL: redis://localhost:6379
+          
+      - name: 🔍 OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -j -m 10 -T 30 -z "-configFile /zap/wrk/.zap/zap.conf"'
+          artifact_name: 'zap-full-scan'
+          fail_action: false
+          
+      - name: 🔍 OWASP ZAP API Scan
+        run: |
+          # Generate OpenAPI spec if available
+          if [ -f "api/openapi.yaml" ]; then
+            docker run --rm -v $(pwd):/zap/wrk/:rw \
+              -t owasp/zap2docker-stable zap-api-scan.py \
+              -t http://host.docker.internal:8080/api/v1/swagger.json \
+              -f openapi \
+              -r zap-api-report.html \
+              -J zap-api-report.json \
+              -w zap-api-report.md
+          fi
+          
+      - name: 🔍 Nuclei Vulnerability Scan
+        run: |
+          # Install Nuclei
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          
+          # Update templates
+          nuclei -update-templates
+          
+          # Run scan
+          nuclei -u http://localhost:8080 \
+            -t ~/nuclei-templates/ \
+            -severity critical,high,medium \
+            -json -o nuclei-report.json \
+            -stats \
+            -silent
+            
+      - name: 🔍 Nikto Web Server Scan
+        run: |
+          # Install and run Nikto
+          docker run --rm -v $(pwd):/tmp sullo/nikto \
+            -h http://host.docker.internal:8080 \
+            -Format json \
+            -output /tmp/nikto-report.json
+            
+      - name: 🔍 Custom Security Tests
+        run: |
+          cat > security-tests.sh << 'EOF'
+          #!/bin/bash
+          
+          BASE_URL="http://localhost:8080"
+          ISSUES=()
+          
+          # Test for SQL injection
+          echo "Testing for SQL injection..."
+          RESPONSE=$(curl -s "$BASE_URL/api/v1/emails?search=' OR '1'='1" || true)
+          if echo "$RESPONSE" | grep -q "database error"; then
+            ISSUES+=("Potential SQL injection vulnerability")
+          fi
+          
+          # Test for XSS
+          echo "Testing for XSS..."
+          RESPONSE=$(curl -s "$BASE_URL/api/v1/emails?search=<script>alert('xss')</script>" || true)
+          if echo "$RESPONSE" | grep -q "<script>"; then
+            ISSUES+=("Potential XSS vulnerability")
+          fi
+          
+          # Test for CSRF protection
+          echo "Testing CSRF protection..."
+          RESPONSE=$(curl -s -X POST "$BASE_URL/api/v1/emails" -H "Content-Type: application/json" -d '{}' || true)
+          if [ $(echo "$RESPONSE" | jq -r '.error' 2>/dev/null) != "CSRF token required" ]; then
+            ISSUES+=("CSRF protection may be missing")
+          fi
+          
+          # Test for authentication bypass
+          echo "Testing authentication bypass..."
+          RESPONSE=$(curl -s "$BASE_URL/api/v1/admin/users" || true)
+          if [ $(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/admin/users") != "401" ]; then
+            ISSUES+=("Authentication bypass possible")
+          fi
+          
+          # Test for sensitive information disclosure
+          echo "Testing for information disclosure..."
+          RESPONSE=$(curl -s "$BASE_URL/.env" || true)
+          if [ $(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/.env") != "404" ]; then
+            ISSUES+=("Sensitive files accessible")
+          fi
+          
+          # Generate report
+          printf '%s\n' "${ISSUES[@]}" | jq -R . | jq -s . > custom-security-issues.json
+          EOF
+          
+          chmod +x security-tests.sh
+          ./security-tests.sh
+          
+      - name: 📊 Aggregate DAST Results
+        id: dast-results
+        run: |
+          mkdir -p security-reports
+          
+          echo "Aggregating DAST results..."
+          
+          CRITICAL_DAST=0
+          HIGH_DAST=0
+          MEDIUM_DAST=0
+          
+          # Count from ZAP scan
+          if [ -f "report_json.json" ]; then
+            ZAP_HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' report_json.json 2>/dev/null || echo "0")
+            ZAP_MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode == "2")] | length' report_json.json 2>/dev/null || echo "0")
+            
+            HIGH_DAST=$((HIGH_DAST + ZAP_HIGH))
+            MEDIUM_DAST=$((MEDIUM_DAST + ZAP_MEDIUM))
+          fi
+          
+          # Count from Nuclei scan
+          if [ -f "nuclei-report.json" ]; then
+            NUCLEI_CRITICAL=$(jq '[. | select(.info.severity == "critical")] | length' nuclei-report.json 2>/dev/null || echo "0")
+            NUCLEI_HIGH=$(jq '[. | select(.info.severity == "high")] | length' nuclei-report.json 2>/dev/null || echo "0")
+            NUCLEI_MEDIUM=$(jq '[. | select(.info.severity == "medium")] | length' nuclei-report.json 2>/dev/null || echo "0")
+            
+            CRITICAL_DAST=$((CRITICAL_DAST + NUCLEI_CRITICAL))
+            HIGH_DAST=$((HIGH_DAST + NUCLEI_HIGH))
+            MEDIUM_DAST=$((MEDIUM_DAST + NUCLEI_MEDIUM))
+          fi
+          
+          # Count custom security issues
+          if [ -f "custom-security-issues.json" ]; then
+            CUSTOM_ISSUES=$(jq 'length' custom-security-issues.json)
+            HIGH_DAST=$((HIGH_DAST + CUSTOM_ISSUES))
+          fi
+          
+          echo "DAST Results:"
+          echo "Critical: $CRITICAL_DAST"
+          echo "High: $HIGH_DAST"
+          echo "Medium: $MEDIUM_DAST"
+          
+          # Generate summary
+          cat > security-reports/dast-summary.json << EOF
+          {
+            "scan_type": "DAST",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "vulnerabilities": {
+              "critical": $CRITICAL_DAST,
+              "high": $HIGH_DAST,
+              "medium": $MEDIUM_DAST,
+              "low": 0
+            }
+          }
+          EOF
+          
+          echo "results=$(cat security-reports/dast-summary.json | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 🛑 Cleanup Application
+        if: always()
+        run: |
+          if [ -n "$APP_PID" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+          
+      - name: 📤 Upload DAST Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-results-${{ github.sha }}
+          path: |
+            security-reports/
+            report_json.json
+            zap-api-report.json
+            nuclei-report.json
+            nikto-report.json
+            custom-security-issues.json
+
+  # ===== SECURITY QUALITY GATE VALIDATION =====
+  security-quality-gate:
+    name: 🛡️ Security Quality Gate Validation
+    runs-on: ubuntu-latest
+    needs: [sast-analysis, dependency-scan, container-security, dast-analysis]
+    if: always()
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Download All Security Reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-results-${{ github.sha }}'
+          merge-multiple: true
+          
+      - name: 📊 Aggregate All Security Results
+        run: |
+          echo "🛡️ Aggregating all security scan results..."
+          
+          mkdir -p final-security-reports
+          
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+          TOTAL_MEDIUM=0
+          TOTAL_LOW=0
+          
+          # Aggregate results from all scans
+          for summary_file in security-reports/*-summary.json; do
+            if [ -f "$summary_file" ]; then
+              SCAN_TYPE=$(jq -r '.scan_type' "$summary_file")
+              CRITICAL=$(jq '.vulnerabilities.critical' "$summary_file")
+              HIGH=$(jq '.vulnerabilities.high' "$summary_file")
+              MEDIUM=$(jq '.vulnerabilities.medium' "$summary_file")
+              LOW=$(jq '.vulnerabilities.low' "$summary_file")
+              
+              echo "$SCAN_TYPE: Critical=$CRITICAL, High=$HIGH, Medium=$MEDIUM, Low=$LOW"
+              
+              TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
+              TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+              TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
+              TOTAL_LOW=$((TOTAL_LOW + LOW))
+            fi
+          done
+          
+          echo "==================================="
+          echo "TOTAL SECURITY RESULTS:"
+          echo "Critical: $TOTAL_CRITICAL"
+          echo "High: $TOTAL_HIGH"
+          echo "Medium: $TOTAL_MEDIUM"
+          echo "Low: $TOTAL_LOW"
+          echo "==================================="
+          
+          # Generate final security report
+          cat > final-security-reports/security-summary.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit_sha": "${{ github.sha }}",
+            "total_vulnerabilities": {
+              "critical": $TOTAL_CRITICAL,
+              "high": $TOTAL_HIGH,
+              "medium": $TOTAL_MEDIUM,
+              "low": $TOTAL_LOW
+            },
+            "scans_performed": ["SAST", "DEPENDENCY", "CONTAINER", "DAST"],
+            "quality_gate_thresholds": {
+              "max_critical": ${{ env.MAX_CRITICAL_VULNERABILITIES }},
+              "max_high": ${{ env.MAX_HIGH_VULNERABILITIES }},
+              "max_medium": ${{ env.MAX_MEDIUM_VULNERABILITIES }},
+              "min_security_score": ${{ env.MIN_SECURITY_SCORE }}
+            }
+          }
+          EOF
+          
+          echo "TOTAL_CRITICAL=$TOTAL_CRITICAL" >> $GITHUB_ENV
+          echo "TOTAL_HIGH=$TOTAL_HIGH" >> $GITHUB_ENV
+          echo "TOTAL_MEDIUM=$TOTAL_MEDIUM" >> $GITHUB_ENV
+          
+      - name: 🎯 Security Quality Gate Validation
+        run: |
+          echo "🎯 Validating security quality gates..."
+          
+          FAILED_GATES=()
+          
+          # Check critical vulnerabilities
+          if [ "$TOTAL_CRITICAL" -gt "$MAX_CRITICAL_VULNERABILITIES" ]; then
+            FAILED_GATES+=("Critical vulnerabilities: $TOTAL_CRITICAL > $MAX_CRITICAL_VULNERABILITIES")
+          fi
+          
+          # Check high vulnerabilities
+          if [ "$TOTAL_HIGH" -gt "$MAX_HIGH_VULNERABILITIES" ]; then
+            FAILED_GATES+=("High vulnerabilities: $TOTAL_HIGH > $MAX_HIGH_VULNERABILITIES")
+          fi
+          
+          # Check medium vulnerabilities
+          if [ "$TOTAL_MEDIUM" -gt "$MAX_MEDIUM_VULNERABILITIES" ]; then
+            FAILED_GATES+=("Medium vulnerabilities: $TOTAL_MEDIUM > $MAX_MEDIUM_VULNERABILITIES")
+          fi
+          
+          # Calculate overall security score
+          SECURITY_SCORE=${{ needs.sast-analysis.outputs.security-score || '0' }}
+          if [ "$SECURITY_SCORE" -lt "$MIN_SECURITY_SCORE" ]; then
+            FAILED_GATES+=("Security score: $SECURITY_SCORE < $MIN_SECURITY_SCORE")
+          fi
+          
+          # Generate quality gate report
+          if [ ${#FAILED_GATES[@]} -eq 0 ]; then
+            echo "✅ ALL SECURITY QUALITY GATES PASSED"
+            echo "The build meets all fortress-grade security requirements."
+            echo "SECURITY_GATE_STATUS=PASSED" >> $GITHUB_ENV
+          else
+            echo "❌ SECURITY QUALITY GATES FAILED"
+            echo "The following security quality gates failed:"
+            printf '%s\n' "${FAILED_GATES[@]}"
+            echo "SECURITY_GATE_STATUS=FAILED" >> $GITHUB_ENV
+          fi
+          
+          # Add status to final report
+          jq --arg status "${{ env.SECURITY_GATE_STATUS }}" \
+             --argjson failed_gates "$(printf '%s\n' "${FAILED_GATES[@]}" | jq -R . | jq -s .)" \
+             '. + {quality_gate_status: $status, failed_gates: $failed_gates}' \
+             final-security-reports/security-summary.json > temp.json && \
+             mv temp.json final-security-reports/security-summary.json
+          
+      - name: 📊 Generate Security Dashboard
+        run: |
+          cat > final-security-reports/security-dashboard.md << EOF
+          # 🛡️ Fortress Security Dashboard
+          
+          ## 📊 Security Scan Summary
+          
+          **Scan Date**: $(date -u +%Y-%m-%d\ %H:%M:%S)\ UTC  
+          **Commit SHA**: \`${{ github.sha }}\`  
+          **Quality Gate Status**: ${{ env.SECURITY_GATE_STATUS == 'PASSED' && '✅ PASSED' || '❌ FAILED' }}
+          
+          ### Vulnerability Summary
+          
+          | Severity | Count | Threshold | Status |
+          |----------|-------|-----------|--------|
+          | Critical | $TOTAL_CRITICAL | ≤ $MAX_CRITICAL_VULNERABILITIES | $([ "$TOTAL_CRITICAL" -le "$MAX_CRITICAL_VULNERABILITIES" ] && echo "✅" || echo "❌") |
+          | High | $TOTAL_HIGH | ≤ $MAX_HIGH_VULNERABILITIES | $([ "$TOTAL_HIGH" -le "$MAX_HIGH_VULNERABILITIES" ] && echo "✅" || echo "❌") |
+          | Medium | $TOTAL_MEDIUM | ≤ $MAX_MEDIUM_VULNERABILITIES | $([ "$TOTAL_MEDIUM" -le "$MAX_MEDIUM_VULNERABILITIES" ] && echo "✅" || echo "❌") |
+          | Low | $TOTAL_LOW | - | ℹ️ |
+          
+          ### Scan Coverage
+          
+          - ✅ Static Application Security Testing (SAST)
+          - ✅ Dependency Security Scanning
+          - ✅ Container Security Scanning  
+          - ✅ Dynamic Application Security Testing (DAST)
+          
+          ### Security Score
+          
+          **Overall Security Score**: ${{ needs.sast-analysis.outputs.security-score || 'N/A' }}/100
+          
+          $([ "${{ env.SECURITY_GATE_STATUS }}" = "PASSED" ] && echo "## ✅ Security Quality Gates Passed
+          
+          All security quality gates have been successfully validated. The application meets fortress-grade security standards and is ready for deployment." || echo "## ❌ Security Quality Gates Failed
+          
+          One or more security quality gates have failed. Please review and address the security issues before deployment.")
+          
+          ---
+          
+          *Generated by Fortress Security Pipeline*
+          EOF
+          
+      - name: 📤 Upload Final Security Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-security-reports-${{ github.sha }}
+          path: final-security-reports/
+          
+      - name: 💬 Comment Security Results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('final-security-reports/security-dashboard.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+            
+      - name: ❌ Fail Build if Security Gates Failed
+        if: env.SECURITY_GATE_STATUS == 'FAILED'
+        run: |
+          echo "❌ Security quality gates failed. Build blocked for security reasons."
+          echo "Please address the security vulnerabilities before proceeding."
+          exit 1

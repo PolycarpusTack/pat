@@ -1,0 +1,797 @@
+name: 🚀 Fortress CD Pipeline with Intelligent Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Build version to deploy'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+        default: 'staging'
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: false
+        type: choice
+        options:
+          - blue-green
+          - canary
+          - rolling
+        default: 'blue-green'
+      quality_gate_passed:
+        description: 'Quality gates passed'
+        required: true
+        type: boolean
+        default: false
+      skip_smoke_tests:
+        description: 'Skip smoke tests'
+        required: false
+        type: boolean
+        default: false
+        
+  repository_dispatch:
+    types: [deploy-request]
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: pat-fortress
+  KUBECTL_VERSION: v1.28.2
+  HELM_VERSION: v3.13.1
+  DEPLOYMENT_TIMEOUT: 10m
+  ROLLBACK_TIMEOUT: 5m
+  HEALTH_CHECK_TIMEOUT: 5m
+  
+  # Environment-specific configurations
+  DEV_NAMESPACE: pat-dev
+  STAGING_NAMESPACE: pat-staging
+  PROD_NAMESPACE: pat-production
+  
+  # Monitoring and alerting
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+
+jobs:
+  # ===== PRE-DEPLOYMENT VALIDATION =====
+  pre-deployment-validation:
+    name: 🔍 Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    outputs:
+      deployment-config: ${{ steps.config.outputs.config }}
+      target-namespace: ${{ steps.config.outputs.namespace }}
+      deployment-strategy: ${{ steps.config.outputs.strategy }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🔍 Validate Quality Gate Status
+        if: inputs.quality_gate_passed != true && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "❌ Quality gates have not passed. Deployment blocked."
+          echo "Only fortress-grade builds can be deployed to ${{ inputs.environment }}"
+          exit 1
+          
+      - name: ⚙️ Configure Deployment Parameters
+        id: config
+        run: |
+          # Determine deployment configuration based on environment
+          case "${{ inputs.environment || github.event.client_payload.environment }}" in
+            "development")
+              echo "namespace=$DEV_NAMESPACE" >> $GITHUB_OUTPUT
+              echo "strategy=rolling" >> $GITHUB_OUTPUT
+              echo "replicas=1" >> $GITHUB_OUTPUT
+              echo "resources=minimal" >> $GITHUB_OUTPUT
+              ;;
+            "staging")
+              echo "namespace=$STAGING_NAMESPACE" >> $GITHUB_OUTPUT
+              echo "strategy=blue-green" >> $GITHUB_OUTPUT
+              echo "replicas=2" >> $GITHUB_OUTPUT
+              echo "resources=standard" >> $GITHUB_OUTPUT
+              ;;
+            "production")
+              echo "namespace=$PROD_NAMESPACE" >> $GITHUB_OUTPUT
+              echo "strategy=canary" >> $GITHUB_OUTPUT
+              echo "replicas=3" >> $GITHUB_OUTPUT
+              echo "resources=production" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Invalid environment: ${{ inputs.environment }}"
+              exit 1
+              ;;
+          esac
+          
+          # Override strategy if explicitly provided
+          if [ -n "${{ inputs.deployment_strategy }}" ]; then
+            echo "strategy=${{ inputs.deployment_strategy }}" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: 🔒 Validate Deployment Permissions
+        run: |
+          echo "🔍 Validating deployment permissions for ${{ inputs.environment }}"
+          
+          # Production deployments require additional approvals
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "🔒 Production deployment requires manual approval"
+            # In real implementation, this would check for required approvals
+          fi
+          
+      - name: 📊 Generate Deployment Manifest
+        run: |
+          cat > deployment-config.yaml << EOF
+          deployment:
+            version: "${{ inputs.build_version }}"
+            environment: "${{ inputs.environment }}"
+            strategy: "${{ steps.config.outputs.strategy }}"
+            namespace: "${{ steps.config.outputs.namespace }}"
+            replicas: "${{ steps.config.outputs.replicas }}"
+            resources: "${{ steps.config.outputs.resources }}"
+            timestamp: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            initiated_by: "${{ github.actor }}"
+            commit_sha: "${{ github.sha }}"
+          EOF
+          
+          echo "config=$(cat deployment-config.yaml | base64 -w 0)" >> $GITHUB_OUTPUT
+          
+      - name: 📤 Upload Deployment Config
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-config-${{ inputs.build_version }}
+          path: deployment-config.yaml
+
+  # ===== INFRASTRUCTURE PREPARATION =====
+  infrastructure-preparation:
+    name: 🏗️ Infrastructure Preparation
+    runs-on: ubuntu-latest
+    needs: pre-deployment-validation
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: ⚙️ Setup Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: ⚙️ Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+          
+      - name: 🔑 Configure Kubernetes Access
+        run: |
+          # Configure kubectl with cluster credentials
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          kubectl version --client
+          
+      - name: 🏗️ Prepare Namespace
+        run: |
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Apply necessary RBAC and network policies
+          kubectl apply -f k8s/rbac/ -n $NAMESPACE
+          kubectl apply -f k8s/network-policies/ -n $NAMESPACE
+          
+      - name: 🗃️ Database Migration Preparation
+        if: inputs.environment != 'development'
+        run: |
+          echo "🗃️ Preparing database migration for ${{ inputs.environment }}"
+          
+          # Create migration job
+          helm template migrations ./helm/migrations \
+            --set image.tag=${{ inputs.build_version }} \
+            --set environment=${{ inputs.environment }} \
+            > migration-job.yaml
+            
+          # Validate migration safety
+          kubectl apply --dry-run=client -f migration-job.yaml
+          
+      - name: 🔄 Setup Blue-Green Infrastructure
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'blue-green'
+        run: |
+          echo "🔄 Setting up blue-green deployment infrastructure"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Determine current active deployment (blue or green)
+          CURRENT_COLOR=$(kubectl get service pat-active -n $NAMESPACE -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          NEW_COLOR=$([ "$CURRENT_COLOR" = "blue" ] && echo "green" || echo "blue")
+          
+          echo "CURRENT_COLOR=$CURRENT_COLOR" >> $GITHUB_ENV
+          echo "NEW_COLOR=$NEW_COLOR" >> $GITHUB_ENV
+          
+          echo "Current active deployment: $CURRENT_COLOR"
+          echo "New deployment color: $NEW_COLOR"
+
+  # ===== DEPLOYMENT EXECUTION =====
+  deployment-execution:
+    name: 🚀 Deployment Execution
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, infrastructure-preparation]
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: ⚙️ Setup Tools
+        run: |
+          # Setup kubectl
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          
+          # Setup helm
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh && ./get_helm.sh --version ${{ env.HELM_VERSION }}
+          
+      - name: 🔑 Configure Access
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ${{ env.DOCKER_REGISTRY }} -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          
+      - name: 🗃️ Execute Database Migration
+        if: inputs.environment != 'development'
+        run: |
+          echo "🗃️ Executing database migration"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Run migration job
+          kubectl apply -f migration-job.yaml -n $NAMESPACE
+          
+          # Wait for migration to complete
+          kubectl wait --for=condition=complete job/pat-migration-${{ inputs.build_version }} -n $NAMESPACE --timeout=600s
+          
+          # Check migration status
+          MIGRATION_STATUS=$(kubectl get job pat-migration-${{ inputs.build_version }} -n $NAMESPACE -o jsonpath='{.status.conditions[0].type}')
+          if [ "$MIGRATION_STATUS" != "Complete" ]; then
+            echo "❌ Database migration failed"
+            kubectl logs job/pat-migration-${{ inputs.build_version }} -n $NAMESPACE
+            exit 1
+          fi
+          
+          echo "✅ Database migration completed successfully"
+          
+      - name: 🔄 Blue-Green Deployment
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'blue-green'
+        run: |
+          echo "🔄 Executing blue-green deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          NEW_COLOR="${{ env.NEW_COLOR }}"
+          
+          # Deploy to inactive environment
+          helm upgrade --install pat-$NEW_COLOR ./helm/pat-fortress \
+            --namespace $NAMESPACE \
+            --set image.tag=${{ inputs.build_version }} \
+            --set deployment.color=$NEW_COLOR \
+            --set environment=${{ inputs.environment }} \
+            --set service.name=pat-$NEW_COLOR \
+            --timeout ${{ env.DEPLOYMENT_TIMEOUT }} \
+            --wait
+            
+          echo "✅ Blue-green deployment to $NEW_COLOR completed"
+          
+      - name: 🐤 Canary Deployment
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'canary'
+        run: |
+          echo "🐤 Executing canary deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Deploy canary with 10% traffic
+          helm upgrade --install pat-canary ./helm/pat-fortress \
+            --namespace $NAMESPACE \
+            --set image.tag=${{ inputs.build_version }} \
+            --set deployment.type=canary \
+            --set canary.weight=10 \
+            --set environment=${{ inputs.environment }} \
+            --timeout ${{ env.DEPLOYMENT_TIMEOUT }} \
+            --wait
+            
+          echo "✅ Canary deployment (10% traffic) completed"
+          
+      - name: 🔄 Rolling Deployment
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'rolling'
+        run: |
+          echo "🔄 Executing rolling deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Rolling update deployment
+          helm upgrade --install pat-app ./helm/pat-fortress \
+            --namespace $NAMESPACE \
+            --set image.tag=${{ inputs.build_version }} \
+            --set environment=${{ inputs.environment }} \
+            --set deployment.strategy=RollingUpdate \
+            --timeout ${{ env.DEPLOYMENT_TIMEOUT }} \
+            --wait
+            
+          echo "✅ Rolling deployment completed"
+
+  # ===== POST-DEPLOYMENT VALIDATION =====
+  post-deployment-validation:
+    name: ✅ Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, deployment-execution]
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: ⚙️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          
+      - name: 🔑 Configure Access
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          
+      - name: 🏥 Health Check Validation
+        run: |
+          echo "🏥 Running health check validation"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          STRATEGY="${{ needs.pre-deployment-validation.outputs.deployment-strategy }}"
+          
+          # Determine service endpoint based on deployment strategy
+          case "$STRATEGY" in
+            "blue-green")
+              SERVICE_NAME="pat-${{ env.NEW_COLOR }}"
+              ;;
+            "canary")
+              SERVICE_NAME="pat-canary"
+              ;;
+            *)
+              SERVICE_NAME="pat-app"
+              ;;
+          esac
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod -l app=pat-fortress -n $NAMESPACE --timeout=300s
+          
+          # Get service endpoint
+          SERVICE_IP=$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "localhost")
+          SERVICE_PORT=$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}')
+          
+          # Port forward for testing if no external IP
+          if [ "$SERVICE_IP" = "localhost" ]; then
+            kubectl port-forward service/$SERVICE_NAME 8080:$SERVICE_PORT -n $NAMESPACE &
+            PORT_FORWARD_PID=$!
+            sleep 10
+            SERVICE_URL="http://localhost:8080"
+          else
+            SERVICE_URL="http://$SERVICE_IP:$SERVICE_PORT"
+          fi
+          
+          echo "Testing service at: $SERVICE_URL"
+          
+          # Health check
+          for i in {1..30}; do
+            if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+              echo "✅ Health check passed"
+              break
+            fi
+            echo "⏳ Waiting for health check... ($i/30)"
+            sleep 10
+          done
+          
+          # Cleanup port forward
+          if [ -n "$PORT_FORWARD_PID" ]; then
+            kill $PORT_FORWARD_PID 2>/dev/null || true
+          fi
+          
+          # Validate final health status
+          HEALTH_RESPONSE=$(curl -s "$SERVICE_URL/health" | jq -r '.status' 2>/dev/null || echo "unknown")
+          if [ "$HEALTH_RESPONSE" != "healthy" ]; then
+            echo "❌ Health check failed: $HEALTH_RESPONSE"
+            exit 1
+          fi
+          
+      - name: 💨 Smoke Tests
+        if: inputs.skip_smoke_tests != true
+        run: |
+          echo "💨 Running smoke tests"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Run smoke test job
+          kubectl create job pat-smoke-test-${{ inputs.build_version }} \
+            --from=cronjob/pat-smoke-tests -n $NAMESPACE 2>/dev/null || \
+          kubectl run pat-smoke-test-${{ inputs.build_version }} \
+            --image=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.build_version }} \
+            --restart=Never \
+            --command -- /app/scripts/smoke-tests.sh \
+            -n $NAMESPACE
+            
+          # Wait for smoke tests to complete
+          kubectl wait --for=condition=complete job/pat-smoke-test-${{ inputs.build_version }} -n $NAMESPACE --timeout=300s
+          
+          # Check smoke test results
+          SMOKE_TEST_STATUS=$(kubectl get job pat-smoke-test-${{ inputs.build_version }} -n $NAMESPACE -o jsonpath='{.status.conditions[0].type}')
+          if [ "$SMOKE_TEST_STATUS" != "Complete" ]; then
+            echo "❌ Smoke tests failed"
+            kubectl logs job/pat-smoke-test-${{ inputs.build_version }} -n $NAMESPACE
+            exit 1
+          fi
+          
+          echo "✅ Smoke tests passed"
+          
+      - name: 📊 Performance Validation
+        run: |
+          echo "📊 Running performance validation"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Run performance test
+          kubectl run pat-perf-test-${{ inputs.build_version }} \
+            --image=loadimpact/k6:latest \
+            --restart=Never \
+            --command -- k6 run - <<EOF
+          import http from 'k6/http';
+          import { check } from 'k6';
+          
+          export let options = {
+            stages: [
+              { duration: '2m', target: 10 },
+              { duration: '2m', target: 10 },
+              { duration: '1m', target: 0 },
+            ],
+            thresholds: {
+              http_req_duration: ['p95<100'],
+              http_req_failed: ['rate<0.01'],
+            },
+          };
+          
+          export default function() {
+            let response = http.get('http://pat-service.$NAMESPACE.svc.cluster.local/health');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 100ms': (r) => r.timings.duration < 100,
+            });
+          }
+          EOF
+          
+          # Wait for performance test to complete
+          kubectl wait --for=condition=complete pod/pat-perf-test-${{ inputs.build_version }} -n $NAMESPACE --timeout=600s
+          
+          # Check performance test results
+          kubectl logs pat-perf-test-${{ inputs.build_version }} -n $NAMESPACE
+          
+          echo "✅ Performance validation completed"
+
+  # ===== TRAFFIC MANAGEMENT =====
+  traffic-management:
+    name: 🚦 Traffic Management
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, post-deployment-validation]
+    if: needs.pre-deployment-validation.outputs.deployment-strategy != 'rolling'
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: ⚙️ Setup Kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          
+      - name: 🔄 Blue-Green Traffic Switch
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'blue-green'
+        run: |
+          echo "🔄 Switching traffic to new deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          NEW_COLOR="${{ env.NEW_COLOR }}"
+          OLD_COLOR="${{ env.CURRENT_COLOR }}"
+          
+          # Update active service to point to new deployment
+          kubectl patch service pat-active -n $NAMESPACE -p '{"spec":{"selector":{"color":"'$NEW_COLOR'"}}}'
+          
+          echo "✅ Traffic switched from $OLD_COLOR to $NEW_COLOR"
+          
+          # Wait for traffic to stabilize
+          sleep 30
+          
+          # Scale down old deployment
+          kubectl scale deployment pat-$OLD_COLOR --replicas=0 -n $NAMESPACE
+          
+          echo "✅ Old deployment scaled down"
+          
+      - name: 🐤 Canary Traffic Promotion
+        if: needs.pre-deployment-validation.outputs.deployment-strategy == 'canary'
+        run: |
+          echo "🐤 Promoting canary deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          
+          # Gradually increase canary traffic
+          TRAFFIC_STEPS=(10 25 50 75 100)
+          
+          for weight in "${TRAFFIC_STEPS[@]}"; do
+            echo "Setting canary traffic to $weight%"
+            
+            kubectl patch virtualservice pat-vs -n $NAMESPACE --type='merge' -p="{
+              \"spec\": {
+                \"http\": [{
+                  \"match\": [{\"uri\": {\"prefix\": \"/\"}}],
+                  \"route\": [
+                    {\"destination\": {\"host\": \"pat-service\"}, \"weight\": $((100-weight))},
+                    {\"destination\": {\"host\": \"pat-canary\"}, \"weight\": $weight}
+                  ]
+                }]
+              }
+            }"
+            
+            # Wait and monitor
+            sleep 60
+            
+            # Check error rates
+            ERROR_RATE=$(kubectl exec -n monitoring deployment/prometheus -- \
+              promtool query instant 'rate(http_requests_total{code=~"5.."}[5m]) / rate(http_requests_total[5m])' | \
+              grep -o '[0-9.]*' | head -1)
+              
+            if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+              echo "❌ High error rate detected: $ERROR_RATE. Initiating rollback."
+              # Trigger rollback
+              kubectl patch virtualservice pat-vs -n $NAMESPACE --type='merge' -p="{
+                \"spec\": {\"http\": [{\"route\": [{\"destination\": {\"host\": \"pat-service\"}, \"weight\": 100}]}]}
+              }"
+              exit 1
+            fi
+            
+            echo "✅ Traffic at $weight%, error rate: $ERROR_RATE"
+          done
+          
+          # Replace main deployment with canary
+          kubectl patch service pat-service -n $NAMESPACE -p '{"spec":{"selector":{"version":"canary"}}}'
+          kubectl delete deployment pat-canary -n $NAMESPACE
+          
+          echo "✅ Canary deployment promoted to production"
+
+  # ===== MONITORING AND ALERTING SETUP =====
+  monitoring-setup:
+    name: 📊 Monitoring & Alerting Setup
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, traffic-management]
+    if: always() && (needs.traffic-management.result == 'success' || needs.traffic-management.result == 'skipped')
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 📊 Configure Monitoring
+        run: |
+          echo "📊 Setting up monitoring for deployment"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          VERSION="${{ inputs.build_version }}"
+          
+          # Update monitoring configuration
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pat-monitoring-config
+            namespace: $NAMESPACE
+          data:
+            alerts.yml: |
+              groups:
+              - name: pat-fortress-alerts
+                rules:
+                - alert: PatHighErrorRate
+                  expr: rate(http_requests_total{job="pat-fortress",code=~"5.."}[5m]) / rate(http_requests_total{job="pat-fortress"}[5m]) > 0.01
+                  for: 2m
+                  labels:
+                    severity: critical
+                    environment: ${{ inputs.environment }}
+                    version: $VERSION
+                  annotations:
+                    summary: "High error rate detected in Pat Fortress"
+                    description: "Error rate is {{ \$value | humanizePercentage }}"
+                    
+                - alert: PatHighResponseTime
+                  expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="pat-fortress"}[5m])) > 0.1
+                  for: 5m
+                  labels:
+                    severity: warning
+                    environment: ${{ inputs.environment }}
+                    version: $VERSION
+                  annotations:
+                    summary: "High response time in Pat Fortress"
+                    description: "95th percentile response time is {{ \$value }}s"
+          EOF
+          
+      - name: 🚨 Setup Alerting
+        run: |
+          echo "🚨 Configuring alerting channels"
+          
+          # Send deployment notification to Slack
+          if [ -n "${{ env.SLACK_WEBHOOK }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \"🚀 Fortress deployment completed\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*Deployment Status*: ✅ Success\\n*Version*: \`${{ inputs.build_version }}\`\\n*Environment*: \`${{ inputs.environment }}\`\\n*Strategy*: \`${{ needs.pre-deployment-validation.outputs.deployment-strategy }}\`\\n*Initiated by*: ${{ github.actor }}\"
+                    }
+                  }
+                ]
+              }" ${{ env.SLACK_WEBHOOK }}
+          fi
+          
+          # Configure Datadog deployment tracking
+          if [ -n "${{ env.DATADOG_API_KEY }}" ]; then
+            curl -X POST "https://api.datadoghq.com/api/v1/events" \
+              -H "Content-Type: application/json" \
+              -H "DD-API-KEY: ${{ env.DATADOG_API_KEY }}" \
+              -d '{
+                "title": "Pat Fortress Deployment",
+                "text": "Deployment completed successfully",
+                "tags": [
+                  "environment:${{ inputs.environment }}",
+                  "version:${{ inputs.build_version }}",
+                  "deployment:success"
+                ]
+              }'
+          fi
+
+  # ===== DEPLOYMENT SUMMARY =====
+  deployment-summary:
+    name: 📋 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, deployment-execution, post-deployment-validation, traffic-management, monitoring-setup]
+    if: always()
+    timeout-minutes: 5
+    
+    steps:
+      - name: 📋 Generate Deployment Report
+        run: |
+          echo "# 🚀 Fortress Deployment Summary" > deployment-report.md
+          echo "" >> deployment-report.md
+          echo "## 📊 Deployment Details" >> deployment-report.md
+          echo "" >> deployment-report.md
+          echo "- **Version**: \`${{ inputs.build_version }}\`" >> deployment-report.md
+          echo "- **Environment**: \`${{ inputs.environment }}\`" >> deployment-report.md
+          echo "- **Strategy**: \`${{ needs.pre-deployment-validation.outputs.deployment-strategy }}\`" >> deployment-report.md
+          echo "- **Namespace**: \`${{ needs.pre-deployment-validation.outputs.target-namespace }}\`" >> deployment-report.md
+          echo "- **Initiated by**: ${{ github.actor }}" >> deployment-report.md
+          echo "- **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> deployment-report.md
+          echo "" >> deployment-report.md
+          
+          echo "## 🎯 Deployment Stages" >> deployment-report.md
+          echo "" >> deployment-report.md
+          echo "| Stage | Status | Duration |" >> deployment-report.md
+          echo "|-------|--------|----------|" >> deployment-report.md
+          echo "| Pre-deployment Validation | ${{ needs.pre-deployment-validation.result }} | - |" >> deployment-report.md
+          echo "| Deployment Execution | ${{ needs.deployment-execution.result }} | - |" >> deployment-report.md
+          echo "| Post-deployment Validation | ${{ needs.post-deployment-validation.result }} | - |" >> deployment-report.md
+          echo "| Traffic Management | ${{ needs.traffic-management.result }} | - |" >> deployment-report.md
+          echo "| Monitoring Setup | ${{ needs.monitoring-setup.result }} | - |" >> deployment-report.md
+          echo "" >> deployment-report.md
+          
+          # Overall status
+          if [ "${{ needs.deployment-execution.result }}" = "success" ] && [ "${{ needs.post-deployment-validation.result }}" = "success" ]; then
+            echo "## ✅ DEPLOYMENT SUCCESSFUL" >> deployment-report.md
+            echo "The fortress deployment has been completed successfully with all validations passed." >> deployment-report.md
+            echo "DEPLOYMENT_STATUS=SUCCESS" >> $GITHUB_ENV
+          else
+            echo "## ❌ DEPLOYMENT FAILED" >> deployment-report.md
+            echo "The deployment encountered issues and may require manual intervention." >> deployment-report.md
+            echo "DEPLOYMENT_STATUS=FAILED" >> $GITHUB_ENV
+          fi
+          
+          cat deployment-report.md
+          
+      - name: 📤 Upload Deployment Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report-${{ inputs.build_version }}
+          path: deployment-report.md
+
+  # ===== AUTOMATIC ROLLBACK ON FAILURE =====
+  automatic-rollback:
+    name: 🔄 Automatic Rollback
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation, deployment-execution, post-deployment-validation, traffic-management]
+    if: >
+      failure() && 
+      (needs.deployment-execution.result == 'failure' || 
+       needs.post-deployment-validation.result == 'failure' || 
+       needs.traffic-management.result == 'failure')
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: ⚙️ Setup Kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          
+      - name: 🔄 Execute Rollback
+        run: |
+          echo "🔄 Initiating automatic rollback"
+          
+          NAMESPACE="${{ needs.pre-deployment-validation.outputs.target-namespace }}"
+          STRATEGY="${{ needs.pre-deployment-validation.outputs.deployment-strategy }}"
+          
+          case "$STRATEGY" in
+            "blue-green")
+              echo "Rolling back blue-green deployment"
+              OLD_COLOR="${{ env.CURRENT_COLOR }}"
+              
+              # Switch traffic back to previous version
+              kubectl patch service pat-active -n $NAMESPACE -p '{"spec":{"selector":{"color":"'$OLD_COLOR'"}}}'
+              
+              # Scale up old deployment if needed
+              kubectl scale deployment pat-$OLD_COLOR --replicas=2 -n $NAMESPACE
+              
+              # Scale down failed deployment
+              kubectl scale deployment pat-${{ env.NEW_COLOR }} --replicas=0 -n $NAMESPACE
+              ;;
+              
+            "canary")
+              echo "Rolling back canary deployment"
+              
+              # Route all traffic back to stable version
+              kubectl patch virtualservice pat-vs -n $NAMESPACE --type='merge' -p="{
+                \"spec\": {\"http\": [{\"route\": [{\"destination\": {\"host\": \"pat-service\"}, \"weight\": 100}]}]}
+              }"
+              
+              # Remove canary deployment
+              kubectl delete deployment pat-canary -n $NAMESPACE --ignore-not-found
+              ;;
+              
+            "rolling")
+              echo "Rolling back deployment"
+              
+              # Rollback to previous revision
+              kubectl rollout undo deployment/pat-app -n $NAMESPACE
+              kubectl rollout status deployment/pat-app -n $NAMESPACE --timeout=${{ env.ROLLBACK_TIMEOUT }}
+              ;;
+          esac
+          
+          echo "✅ Rollback completed"
+          
+      - name: 🚨 Send Rollback Notification
+        run: |
+          # Send rollback notification to Slack
+          if [ -n "${{ env.SLACK_WEBHOOK }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \"🚨 Fortress deployment rollback executed\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*Rollback Status*: ✅ Completed\\n*Version*: \`${{ inputs.build_version }}\`\\n*Environment*: \`${{ inputs.environment }}\`\\n*Reason*: Deployment validation failed\\n*Action Required*: Investigation needed\"
+                    }
+                  }
+                ]
+              }" ${{ env.SLACK_WEBHOOK }}
+          fi

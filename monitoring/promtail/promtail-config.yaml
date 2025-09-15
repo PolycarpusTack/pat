@@ -1,0 +1,536 @@
+# =============================================================================
+# Pat Fortress - Promtail Configuration
+# Comprehensive Log Collection and Processing
+# =============================================================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+# =============================================================================
+# Position Storage
+# =============================================================================
+positions:
+  filename: /tmp/positions.yaml
+
+# =============================================================================
+# Loki Client Configuration
+# =============================================================================
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batch_wait: 1s
+    batch_size: 1048576  # 1MB
+    max_retries: 3
+    timeout: 10s
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+    external_labels:
+      cluster: fortress
+      environment: production
+
+# =============================================================================
+# Scrape Configuration
+# =============================================================================
+scrape_configs:
+
+# =============================================================================
+# Fortress Application Logs
+# =============================================================================
+
+# Fortress Core Service Logs
+- job_name: fortress-core
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-core
+      service: fortress-core
+      environment: production
+      __path__: /fortress/logs/fortress-core*.log
+
+  pipeline_stages:
+  # Parse JSON logs
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        service: service
+        message: message
+        trace_id: trace_id
+        span_id: span_id
+        user_id: user_id
+        request_id: request_id
+        method: method
+        endpoint: endpoint
+        status_code: status_code
+        response_time: response_time
+        
+  # Parse timestamp
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  # Add labels
+  - labels:
+      level:
+      service:
+      trace_id:
+      user_id:
+      method:
+      status_code:
+      
+  # Extract metrics
+  - metrics:
+      fortress_log_entries_total:
+        type: Counter
+        description: "Total log entries by level and service"
+        source: level
+        config:
+          action: inc
+      fortress_request_duration_seconds:
+        type: Histogram
+        description: "HTTP request duration"
+        source: response_time
+        config:
+          buckets: [0.1, 0.3, 1.2, 5.0]
+      fortress_http_requests_total:
+        type: Counter
+        description: "Total HTTP requests"
+        source: status_code
+        config:
+          action: inc
+
+# SMTP Server Logs  
+- job_name: fortress-smtp
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-smtp
+      service: fortress-smtp
+      environment: production
+      __path__: /fortress/smtp/smtp*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        message: message
+        smtp_command: smtp_command
+        client_ip: client_ip
+        message_id: message_id
+        recipients: recipients
+        size: size
+        processing_time: processing_time
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      smtp_command:
+      client_ip:
+      
+  - metrics:
+      fortress_smtp_messages_total:
+        type: Counter
+        description: "Total SMTP messages processed"
+        config:
+          action: inc
+      fortress_smtp_processing_duration_seconds:
+        type: Histogram
+        description: "SMTP message processing duration"
+        source: processing_time
+        config:
+          buckets: [0.1, 0.5, 1.0, 5.0, 10.0]
+
+# GraphQL API Logs
+- job_name: fortress-api
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-api
+      service: fortress-api
+      environment: production
+      __path__: /fortress/api/api*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        message: message
+        query: query
+        variables: variables
+        operation_name: operation_name
+        complexity: complexity
+        depth: depth
+        execution_time: execution_time
+        user_id: user_id
+        trace_id: trace_id
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      operation_name:
+      user_id:
+      trace_id:
+      
+  - metrics:
+      fortress_graphql_operations_total:
+        type: Counter
+        description: "Total GraphQL operations"
+        source: operation_name
+        config:
+          action: inc
+      fortress_graphql_complexity_total:
+        type: Histogram
+        description: "GraphQL query complexity"
+        source: complexity
+        config:
+          buckets: [10, 50, 100, 500, 1000]
+
+# Plugin Runtime Logs
+- job_name: fortress-plugins
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-plugins
+      service: fortress-plugins
+      environment: production
+      __path__: /fortress/plugins/plugins*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        message: message
+        plugin_id: plugin_id
+        plugin_name: plugin_name
+        execution_time: execution_time
+        memory_used: memory_used
+        result: result
+        error: error
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      plugin_name:
+      result:
+      
+  - metrics:
+      fortress_plugin_executions_total:
+        type: Counter
+        description: "Total plugin executions"
+        source: result
+        config:
+          action: inc
+      fortress_plugin_execution_duration_seconds:
+        type: Histogram
+        description: "Plugin execution duration"
+        source: execution_time
+        config:
+          buckets: [0.1, 0.5, 1.0, 5.0, 30.0]
+
+# Workflow Engine Logs
+- job_name: fortress-workflows
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-workflows
+      service: fortress-workflows
+      environment: production
+      __path__: /fortress/workflows/workflows*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        message: message
+        workflow_id: workflow_id
+        workflow_name: workflow_name
+        step_name: step_name
+        status: status
+        execution_time: execution_time
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      workflow_name:
+      step_name:
+      status:
+      
+  - metrics:
+      fortress_workflow_executions_total:
+        type: Counter
+        description: "Total workflow executions"
+        source: status
+        config:
+          action: inc
+      fortress_workflow_step_duration_seconds:
+        type: Histogram
+        description: "Workflow step execution duration"
+        source: execution_time
+        config:
+          buckets: [1.0, 5.0, 15.0, 60.0, 300.0]
+
+# Frontend Application Logs
+- job_name: fortress-frontend
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: fortress-frontend
+      service: fortress-frontend
+      environment: production
+      __path__: /fortress/frontend/frontend*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        message: message
+        user_agent: user_agent
+        ip: ip
+        url: url
+        method: method
+        status: status
+        response_time: response_time
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      method:
+      status:
+      
+  - metrics:
+      fortress_frontend_requests_total:
+        type: Counter
+        description: "Total frontend requests"
+        source: status
+        config:
+          action: inc
+
+# =============================================================================
+# Infrastructure Logs
+# =============================================================================
+
+# Nginx Access Logs
+- job_name: nginx-access
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: nginx
+      service: nginx
+      log_type: access
+      environment: production
+      __path__: /fortress/nginx/access.log
+
+  pipeline_stages:
+  - regex:
+      expression: '^(?P<remote_addr>\S+) - (?P<remote_user>\S+) \[(?P<timestamp>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) (?P<protocol>\S+)" (?P<status>\d+) (?P<bytes_sent>\d+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)" "(?P<forwarded_for>[^"]*)" (?P<request_time>\S+) (?P<upstream_response_time>\S+)'
+      
+  - timestamp:
+      source: timestamp
+      format: 02/Jan/2006:15:04:05 -0700
+      
+  - labels:
+      method:
+      status:
+      remote_addr:
+      
+  - metrics:
+      fortress_nginx_requests_total:
+        type: Counter
+        description: "Total nginx requests"
+        source: status
+        config:
+          action: inc
+      fortress_nginx_request_duration_seconds:
+        type: Histogram
+        description: "Nginx request duration"
+        source: request_time
+        config:
+          buckets: [0.1, 0.3, 1.2, 5.0]
+
+# Nginx Error Logs
+- job_name: nginx-error
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: nginx
+      service: nginx
+      log_type: error
+      environment: production
+      __path__: /fortress/nginx/error.log
+
+  pipeline_stages:
+  - regex:
+      expression: '^(?P<timestamp>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<pid>\d+)#(?P<tid>\d+): (?P<message>.*?)(?:, client: (?P<client>\S+))?(?:, server: (?P<server>\S+))?(?:, request: "(?P<request>[^"]*)")?(?:, host: "(?P<host>[^"]*)")?'
+      
+  - timestamp:
+      source: timestamp
+      format: 2006/01/02 15:04:05
+      
+  - labels:
+      level:
+      client:
+      server:
+
+# =============================================================================
+# System Logs
+# =============================================================================
+
+# Docker Container Logs
+- job_name: docker
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: docker
+      environment: production
+      __path__: /var/lib/docker/containers/*/*-json.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        log: log
+        stream: stream
+        time: time
+        
+  - timestamp:
+      source: time
+      format: RFC3339Nano
+      
+  - output:
+      source: log
+      
+  - labels:
+      stream:
+
+# System Logs
+- job_name: syslog
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: syslog
+      environment: production
+      __path__: /var/log/syslog
+
+  pipeline_stages:
+  - regex:
+      expression: '^(?P<timestamp>\w{3} \d{1,2} \d{2}:\d{2}:\d{2}) (?P<hostname>\S+) (?P<service>\w+)(?:\[(?P<pid>\d+)\])?: (?P<message>.*)'
+      
+  - timestamp:
+      source: timestamp
+      format: Jan _2 15:04:05
+      location: UTC
+      
+  - labels:
+      hostname:
+      service:
+
+# =============================================================================
+# Security Logs
+# =============================================================================
+
+# Authentication Logs
+- job_name: auth-logs
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: auth
+      service: authentication
+      environment: production
+      __path__: /var/log/auth.log
+
+  pipeline_stages:
+  - regex:
+      expression: '^(?P<timestamp>\w{3} \d{1,2} \d{2}:\d{2}:\d{2}) (?P<hostname>\S+) (?P<service>\w+)(?:\[(?P<pid>\d+)\])?: (?P<message>.*)'
+      
+  - timestamp:
+      source: timestamp
+      format: Jan _2 15:04:05
+      location: UTC
+      
+  - labels:
+      hostname:
+      service:
+      
+  - drop:
+      source: message
+      expression: ".*CRON.*"
+
+# =============================================================================
+# Fortress-Specific Log Processing
+# =============================================================================
+
+# Email Processing Logs
+- job_name: email-processing
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: email-processing
+      service: email-processor
+      environment: production
+      __path__: /fortress/logs/email-processing*.log
+
+  pipeline_stages:
+  - json:
+      expressions:
+        timestamp: timestamp
+        level: level
+        email_id: email_id
+        from: from
+        to: to
+        subject: subject
+        size: size
+        processing_stage: processing_stage
+        processing_time: processing_time
+        status: status
+        error: error
+        
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+      
+  - labels:
+      level:
+      processing_stage:
+      status:
+      
+  - metrics:
+      fortress_email_processing_total:
+        type: Counter
+        description: "Total emails processed by stage"
+        source: status
+        config:
+          action: inc

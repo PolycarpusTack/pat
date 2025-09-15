@@ -1,0 +1,215 @@
+syntax = "proto3";
+
+package pat.events.v1;
+
+option go_package = "github.com/pat/api/events/v1;eventsv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
+
+// Common event metadata
+message EventMetadata {
+  string event_id = 1;
+  string correlation_id = 2;
+  string source = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string tenant_id = 5;
+  string user_id = 6;
+  map<string, string> attributes = 7;
+}
+
+// Email attachment
+message Attachment {
+  string id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int64 size = 4;
+  string s3_key = 5;
+  string checksum = 6;
+}
+
+// Email address
+message EmailAddress {
+  string address = 1;
+  string name = 2;
+}
+
+// Email headers
+message EmailHeaders {
+  map<string, string> headers = 1;
+}
+
+// EmailReceived event - triggered when a new email arrives
+message EmailReceived {
+  EventMetadata metadata = 1;
+  
+  string email_id = 2;
+  string message_id = 3;
+  EmailAddress from = 4;
+  repeated EmailAddress to = 5;
+  repeated EmailAddress cc = 6;
+  repeated EmailAddress bcc = 7;
+  string subject = 8;
+  
+  string text_body = 9;
+  string html_body = 10;
+  repeated Attachment attachments = 11;
+  
+  EmailHeaders headers = 12;
+  string raw_email = 13; // Base64 encoded raw email
+  
+  string protocol = 14; // smtp, http, graphql, websocket, grpc
+  string source_ip = 15;
+  int32 source_port = 16;
+  
+  google.protobuf.Timestamp received_at = 17;
+  int64 size_bytes = 18;
+}
+
+// EmailProcessed event - triggered after email processing is complete
+message EmailProcessed {
+  EventMetadata metadata = 1;
+  
+  string email_id = 2;
+  string status = 3; // success, failed, partial
+  
+  message ProcessingResult {
+    bool spam_check_passed = 1;
+    float spam_score = 2;
+    bool virus_check_passed = 3;
+    repeated string virus_signatures = 4;
+    bool dkim_valid = 5;
+    bool spf_valid = 6;
+    bool dmarc_valid = 7;
+  }
+  
+  ProcessingResult result = 4;
+  repeated string applied_rules = 5;
+  repeated string executed_plugins = 6;
+  
+  google.protobuf.Timestamp processed_at = 7;
+  int64 processing_duration_ms = 8;
+  
+  string error_message = 9;
+  string error_code = 10;
+}
+
+// EmailValidated event - triggered when email needs validation
+message EmailValidated {
+  EventMetadata metadata = 1;
+  
+  string email_id = 2;
+  
+  message ValidationResult {
+    string rule_id = 1;
+    string rule_name = 2;
+    bool passed = 3;
+    string message = 4;
+    map<string, string> details = 5;
+  }
+  
+  repeated ValidationResult results = 3;
+  bool overall_valid = 4;
+  string validation_profile = 5;
+  
+  google.protobuf.Timestamp validated_at = 6;
+}
+
+// WorkflowTriggered event - triggered when a workflow needs to be executed
+message WorkflowTriggered {
+  EventMetadata metadata = 1;
+  
+  string workflow_id = 2;
+  string workflow_name = 3;
+  string trigger_type = 4; // manual, rule, schedule, api
+  
+  message WorkflowContext {
+    string email_id = 1;
+    map<string, string> variables = 2;
+    repeated string tags = 3;
+  }
+  
+  WorkflowContext context = 5;
+  string priority = 6; // low, medium, high, critical
+  
+  google.protobuf.Timestamp scheduled_at = 7;
+  string initiated_by = 8;
+}
+
+// PluginExecutionRequired event - triggered when a plugin needs to run
+message PluginExecutionRequired {
+  EventMetadata metadata = 1;
+  
+  string plugin_id = 2;
+  string plugin_name = 3;
+  string plugin_version = 4;
+  
+  message ExecutionContext {
+    string email_id = 1;
+    string workflow_id = 2;
+    map<string, string> parameters = 3;
+    google.protobuf.Any input_data = 4;
+  }
+  
+  ExecutionContext context = 5;
+  string execution_mode = 6; // sync, async
+  int32 timeout_seconds = 7;
+  
+  google.protobuf.Timestamp requested_at = 8;
+}
+
+// PluginExecutionCompleted event - triggered when plugin execution finishes
+message PluginExecutionCompleted {
+  EventMetadata metadata = 1;
+  
+  string plugin_id = 2;
+  string execution_id = 3;
+  string status = 4; // success, failed, timeout
+  
+  google.protobuf.Any output_data = 5;
+  map<string, string> output_metadata = 6;
+  
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp completed_at = 8;
+  int64 duration_ms = 9;
+  
+  string error_message = 10;
+  string error_code = 11;
+}
+
+// EmailDeleted event - triggered when an email is deleted
+message EmailDeleted {
+  EventMetadata metadata = 1;
+  
+  string email_id = 2;
+  string deleted_by = 3;
+  string deletion_reason = 4;
+  
+  google.protobuf.Timestamp deleted_at = 5;
+}
+
+// TenantEvent - for multi-tenant operations
+message TenantEvent {
+  EventMetadata metadata = 1;
+  
+  string event_type = 2; // created, updated, suspended, deleted
+  string tenant_id = 3;
+  string tenant_name = 4;
+  
+  map<string, string> properties = 5;
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+// Generic event wrapper for EventBridge
+message PatEvent {
+  oneof event {
+    EmailReceived email_received = 1;
+    EmailProcessed email_processed = 2;
+    EmailValidated email_validated = 3;
+    WorkflowTriggered workflow_triggered = 4;
+    PluginExecutionRequired plugin_execution_required = 5;
+    PluginExecutionCompleted plugin_execution_completed = 6;
+    EmailDeleted email_deleted = 7;
+    TenantEvent tenant_event = 8;
+  }
+}

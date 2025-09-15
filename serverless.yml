@@ -1,0 +1,264 @@
+# Serverless Framework Configuration for Pat
+
+service: pat-email-testing
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  
+  # IAM Role
+  iam:
+    role: ${cf:pat-${self:provider.stage}-infrastructure.LambdaExecutionRoleArn}
+  
+  # Environment Variables
+  environment:
+    STAGE: ${self:provider.stage}
+    REGION: ${self:provider.region}
+    ATTACHMENTS_BUCKET: ${cf:pat-${self:provider.stage}-infrastructure.AttachmentsBucketName}
+    EMAIL_QUEUE_URL: ${cf:pat-${self:provider.stage}-infrastructure.EmailProcessingQueueUrl}
+    SECRETS_ARN: ${cf:pat-${self:provider.stage}-infrastructure.AppSecretsArn}
+    KMS_KEY_ID: ${cf:pat-${self:provider.stage}-infrastructure.KmsKeyId}
+  
+  # VPC Configuration
+  vpc:
+    securityGroupIds:
+      - ${cf:pat-${self:provider.stage}-infrastructure.LambdaSecurityGroupId}
+    subnetIds: ${cf:pat-${self:provider.stage}-infrastructure.PrivateSubnetIds}
+  
+  # API Gateway
+  apiGateway:
+    minimumCompressionSize: 1024
+    shouldStartNameWithService: true
+    binaryMediaTypes:
+      - 'multipart/form-data'
+      - 'application/octet-stream'
+  
+  # Tracing
+  tracing:
+    lambda: true
+    apiGateway: true
+  
+  # Logs
+  logs:
+    restApi:
+      level: INFO
+      fullExecutionData: true
+    lambda:
+      level: INFO
+
+# Packaging
+package:
+  individually: true
+  patterns:
+    - '!./**'
+    - '!terraform/**'
+    - '!tests/**'
+    - '!docs/**'
+
+# Lambda Functions
+functions:
+  # SMTP Handler
+  smtpHandler:
+    handler: dist/handlers/smtp.handler
+    description: Handles incoming SMTP connections
+    memorySize: 512
+    timeout: 30
+    reservedConcurrency: 100
+    package:
+      patterns:
+        - 'dist/handlers/smtp.js'
+        - 'dist/common/**'
+    events:
+      - eventBridge:
+          eventBus: default
+          pattern:
+            source:
+              - pat.smtp
+            detail-type:
+              - SMTP Connection
+  
+  # Email Processor
+  emailProcessor:
+    handler: dist/handlers/processor.handler
+    description: Processes incoming emails
+    memorySize: 1024
+    timeout: 300
+    reservedConcurrency: 50
+    package:
+      patterns:
+        - 'dist/handlers/processor.js'
+        - 'dist/common/**'
+    events:
+      - sqs:
+          arn: ${cf:pat-${self:provider.stage}-infrastructure.EmailProcessingQueueArn}
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+  
+  # GraphQL API
+  graphqlApi:
+    handler: dist/handlers/graphql.handler
+    description: GraphQL API endpoint
+    memorySize: 512
+    timeout: 30
+    package:
+      patterns:
+        - 'dist/handlers/graphql.js'
+        - 'dist/graphql/**'
+        - 'dist/common/**'
+    events:
+      - http:
+          path: graphql
+          method: post
+          cors: true
+      - http:
+          path: graphql
+          method: get
+          cors: true
+  
+  # WebSocket Handler
+  websocketHandler:
+    handler: dist/handlers/websocket.handler
+    description: Handles WebSocket connections
+    memorySize: 256
+    timeout: 30
+    package:
+      patterns:
+        - 'dist/handlers/websocket.js'
+        - 'dist/common/**'
+    events:
+      - websocket:
+          route: $connect
+      - websocket:
+          route: $disconnect
+      - websocket:
+          route: $default
+  
+  # Plugin Executor
+  pluginExecutor:
+    handler: dist/handlers/plugin.handler
+    description: Executes plugins in sandbox
+    memorySize: 512
+    timeout: 60
+    reservedConcurrency: 20
+    package:
+      patterns:
+        - 'dist/handlers/plugin.js'
+        - 'dist/plugins/**'
+        - 'dist/common/**'
+    events:
+      - sqs:
+          arn: ${cf:pat-${self:provider.stage}-infrastructure.PluginExecutionQueueArn}
+          batchSize: 1
+  
+  # Secret Rotation
+  secretRotation:
+    handler: dist/handlers/rotation.handler
+    description: Rotates secrets automatically
+    memorySize: 256
+    timeout: 60
+    package:
+      patterns:
+        - 'dist/handlers/rotation.js'
+        - 'dist/common/**'
+    events:
+      - schedule:
+          rate: rate(30 days)
+          enabled: ${self:custom.secretRotation.${self:provider.stage}, false}
+
+# Custom Variables
+custom:
+  # Stage-specific settings
+  secretRotation:
+    dev: false
+    staging: false
+    prod: true
+  
+  # Webpack configuration
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules: true
+    packager: 'npm'
+    excludeFiles: tests/**
+  
+  # Prune old versions
+  prune:
+    automatic: true
+    number: 3
+  
+  # API Gateway settings
+  apiGatewayThrottling:
+    maxRequestsPerSecond: 10000
+    maxConcurrentRequests: 5000
+  
+  # CloudWatch Alarms
+  alerts:
+    stages:
+      - prod
+      - staging
+    topics:
+      alarm:
+        topic: ${self:service}-${self:provider.stage}-alerts
+        notifications:
+          - protocol: email
+            endpoint: ${env:ALERT_EMAIL}
+    alarms:
+      - functionErrors
+      - functionThrottles
+      - functionDuration
+
+# Resources
+resources:
+  Description: Pat Email Testing Platform - Serverless Functions
+  
+  Resources:
+    # API Gateway REST API
+    PatApiGatewayRestApi:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: ${self:service}-${self:provider.stage}
+        Description: Pat Email Testing Platform API
+        EndpointConfiguration:
+          Types:
+            - REGIONAL
+        BinaryMediaTypes:
+          - 'multipart/form-data'
+          - 'application/octet-stream'
+    
+    # API Gateway Deployment
+    PatApiGatewayDeployment:
+      Type: AWS::ApiGateway::Deployment
+      Properties:
+        RestApiId:
+          Ref: PatApiGatewayRestApi
+        StageName: ${self:provider.stage}
+        StageDescription:
+          ThrottlingBurstLimit: ${self:custom.apiGatewayThrottling.maxConcurrentRequests}
+          ThrottlingRateLimit: ${self:custom.apiGatewayThrottling.maxRequestsPerSecond}
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+    
+    # Lambda Function URLs (for direct invocation)
+    SmtpHandlerUrl:
+      Type: AWS::Lambda::FunctionUrl
+      Properties:
+        FunctionName:
+          Ref: SmtpHandlerLambdaFunction
+        AuthType: AWS_IAM
+        Cors:
+          AllowOrigins:
+            - '*'
+          AllowMethods:
+            - 'POST'
+          MaxAge: 86400
+
+# Plugins
+plugins:
+  - serverless-webpack
+  - serverless-plugin-aws-alerts
+  - serverless-prune-plugin
+  - serverless-iam-roles-per-function

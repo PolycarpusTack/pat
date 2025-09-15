@@ -1,0 +1,159 @@
+# =============================================================================
+# Pat Fortress Workflow Engine - Multi-stage Production Dockerfile
+# =============================================================================
+
+# ================================
+# Stage 1: Go Builder
+# ================================
+FROM golang:1.21-alpine AS go-builder
+
+RUN apk --no-cache add ca-certificates git tzdata build-base && \
+    addgroup -g 1001 fortress && \
+    adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+# Build workflow engine
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -a -installsuffix cgo \
+    -o fortress-workflow-engine \
+    ./cmd/workflow-engine/main.go
+
+# ================================
+# Stage 2: Node.js Builder
+# ================================
+FROM node:18-alpine AS node-builder
+
+WORKDIR /build
+
+# Copy workflow definitions and processors
+COPY workflows/ ./workflows/
+
+# Install and build workflow processors
+RUN find workflows -name "package.json" -execdir sh -c 'npm ci --only=production && npm run build 2>/dev/null || true' \;
+
+# ================================
+# Stage 3: Production Runtime
+# ================================
+FROM alpine:3.18 AS production
+
+# Install runtime dependencies
+RUN apk --no-cache add \
+    ca-certificates \
+    curl \
+    tzdata \
+    nodejs \
+    npm \
+    dumb-init \
+    && addgroup -g 1001 fortress \
+    && adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+# Create application directories
+RUN mkdir -p \
+    /app/workflows \
+    /app/logs \
+    /app/temp \
+    /app/state \
+    /app/config \
+    /var/lib/fortress-workflows \
+    && chown -R 1001:1001 /app /var/lib/fortress-workflows
+
+# Copy built binaries
+COPY --from=go-builder --chown=1001:1001 /build/fortress-workflow-engine /usr/local/bin/
+
+# Copy built workflows
+COPY --from=node-builder --chown=1001:1001 /build/workflows /app/workflows
+
+# Copy configuration
+COPY --chown=1001:1001 config/workflows/ /app/config/
+
+# Switch to non-root user
+USER 1001:1001
+
+WORKDIR /app
+
+# Environment variables
+ENV WORKFLOW_ENGINE_PORT=8027 \
+    MAX_CONCURRENT_WORKFLOWS=100 \
+    WORKFLOW_TIMEOUT=300000 \
+    WORKFLOW_RETRY_ATTEMPTS=3 \
+    WORKFLOW_STATE_PERSISTENCE=true \
+    WORKFLOW_EVENT_SOURCING=true \
+    LOG_LEVEL=info \
+    FORTRESS_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${WORKFLOW_ENGINE_PORT}/health || exit 1
+
+# Expose workflow engine port
+EXPOSE 8027
+
+# Resource labels for orchestration
+LABEL com.fortress.workflow.cpu="1.0" \
+      com.fortress.workflow.memory="512m" \
+      com.fortress.workflow.disk="1g"
+
+# Graceful shutdown
+STOPSIGNAL SIGTERM
+
+# Use dumb-init for proper signal handling
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+# Start workflow engine
+CMD ["/usr/local/bin/fortress-workflow-engine", \
+     "--port", "8027", \
+     "--workflows-dir", "/app/workflows", \
+     "--config", "/app/config/engine.yaml"]
+
+# ================================
+# Development Stage
+# ================================
+FROM golang:1.21-alpine AS development
+
+RUN apk --no-cache add \
+    ca-certificates \
+    curl \
+    tzdata \
+    nodejs \
+    npm \
+    git \
+    && addgroup -g 1001 fortress \
+    && adduser -D -s /bin/sh -u 1001 -G fortress fortress
+
+WORKDIR /app
+
+# Install development tools
+RUN go install github.com/cosmtrek/air@latest && \
+    npm install -g nodemon
+
+# Copy source
+COPY . .
+RUN go mod download
+
+# Create directories
+RUN mkdir -p workflows logs temp state config && \
+    chown -R 1001:1001 /app
+
+USER 1001:1001
+
+# Development environment
+ENV NODE_ENV=development \
+    LOG_LEVEL=debug \
+    WORKFLOW_HOT_RELOAD=true \
+    WORKFLOW_DEBUG_MODE=true
+
+# Development health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8027/health || exit 1
+
+EXPOSE 8027
+
+# Development with hot reload
+CMD ["air", "-c", ".air.workflow.toml"]

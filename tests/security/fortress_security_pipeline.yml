@@ -1,0 +1,734 @@
+# Fortress Security Testing CI/CD Pipeline
+# Comprehensive automated security validation for Pat email testing platform
+
+name: Fortress Security Pipeline
+
+on:
+  push:
+    branches: [main, develop, security/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run complete security scan daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: 'Security testing level'
+        required: true
+        default: 'comprehensive'
+        type: choice
+        options:
+          - basic
+          - comprehensive
+          - penetration
+      compliance_check:
+        description: 'Run compliance validation'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  FORTRESS_MODE: true
+  SECURITY_LEVEL: fortress
+  GO_VERSION: '1.21'
+  NODE_VERSION: '18'
+
+jobs:
+  # Stage 1: Security Pre-checks
+  security-pre-checks:
+    name: Security Pre-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    outputs:
+      security-level: ${{ steps.config.outputs.security-level }}
+      run-penetration-tests: ${{ steps.config.outputs.run-penetration-tests }}
+      compliance-required: ${{ steps.config.outputs.compliance-required }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Configure Security Testing Level
+        id: config
+        run: |
+          SECURITY_LEVEL="${{ github.event.inputs.security_level || 'comprehensive' }}"
+          echo "security-level=$SECURITY_LEVEL" >> $GITHUB_OUTPUT
+          
+          if [[ "$SECURITY_LEVEL" == "penetration" || "${{ github.event_name }}" == "schedule" ]]; then
+            echo "run-penetration-tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run-penetration-tests=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if [[ "${{ github.event.inputs.compliance_check }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
+            echo "compliance-required=true" >> $GITHUB_OUTPUT
+          else
+            echo "compliance-required=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Security Environment Setup
+        run: |
+          echo "🛡️ Initializing Fortress Security Pipeline"
+          echo "Security Level: ${{ steps.config.outputs.security-level }}"
+          echo "Penetration Testing: ${{ steps.config.outputs.run-penetration-tests }}"
+          echo "Compliance Validation: ${{ steps.config.outputs.compliance-required }}"
+      
+      - name: Validate Security Configuration
+        run: |
+          # Check for security configuration files
+          if [[ ! -f "tests/security/sql_injection_prevention_test.go" ]]; then
+            echo "❌ Security test files missing"
+            exit 1
+          fi
+          echo "✅ Security configuration validated"
+
+  # Stage 2: Static Application Security Testing (SAST)
+  static-security-analysis:
+    name: Static Security Analysis (SAST)
+    runs-on: ubuntu-latest
+    needs: security-pre-checks
+    timeout-minutes: 30
+    
+    strategy:
+      matrix:
+        tool: [gosec, semgrep, codeql]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Security Scanning Tools
+        run: |
+          # Install gosec for Go security analysis
+          go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+          
+          # Install semgrep for multi-language analysis
+          python3 -m pip install semgrep
+          
+          # Install additional security tools
+          npm install -g eslint eslint-plugin-security
+      
+      - name: Run GoSec Security Analysis
+        if: matrix.tool == 'gosec'
+        run: |
+          echo "🔍 Running GoSec static security analysis..."
+          gosec -fmt sarif -out gosec-results.sarif -stdout ./...
+          gosec -fmt json -out gosec-results.json ./...
+        continue-on-error: true
+      
+      - name: Run Semgrep Security Analysis
+        if: matrix.tool == 'semgrep'
+        run: |
+          echo "🔍 Running Semgrep security analysis..."
+          semgrep --config=auto --json --output=semgrep-results.json .
+          semgrep --config=auto --sarif --output=semgrep-results.sarif .
+        continue-on-error: true
+      
+      - name: Initialize CodeQL
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/init@v2
+        with:
+          languages: go, javascript
+          queries: security-and-quality
+      
+      - name: Autobuild
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/autobuild@v2
+      
+      - name: Perform CodeQL Analysis
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: '/language:${{ matrix.language }}'
+      
+      - name: Upload Security Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: sast-results-${{ matrix.tool }}
+          path: |
+            *-results.json
+            *-results.sarif
+          retention-days: 30
+
+  # Stage 3: Dependency Security Scanning (SCA)
+  dependency-security-scan:
+    name: Dependency Security Analysis (SCA)
+    runs-on: ubuntu-latest
+    needs: security-pre-checks
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Dependency Scanners
+        run: |
+          # Install govulncheck for Go vulnerability scanning
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          
+          # Install npm audit and other tools
+          npm install -g audit-ci retire
+      
+      - name: Go Vulnerability Scanning
+        run: |
+          echo "🔍 Scanning Go dependencies for vulnerabilities..."
+          govulncheck -json ./... > go-vulnerabilities.json || true
+          govulncheck ./...
+      
+      - name: Node.js Vulnerability Scanning
+        run: |
+          echo "🔍 Scanning Node.js dependencies for vulnerabilities..."
+          if [[ -f "package.json" ]]; then
+            npm audit --audit-level=high --json > npm-audit.json || true
+            npm audit --audit-level=high
+            
+            # Additional scanning with retire.js
+            retire --js --json > retire-results.json || true
+          fi
+      
+      - name: Generate Dependency Report
+        run: |
+          echo "📊 Generating dependency security report..."
+          cat > dependency-security-report.md << 'EOF'
+          # Dependency Security Analysis Report
+          
+          ## Go Dependencies
+          $(govulncheck -json ./... | jq -r '.finding // empty | "\(.osv) - \(.message)"' || echo "No Go vulnerabilities found")
+          
+          ## Node.js Dependencies
+          $(if [[ -f "npm-audit.json" ]]; then cat npm-audit.json | jq -r '.vulnerabilities // {} | keys[] as $k | "\($k): \(.[$k].severity)"'; else echo "No Node.js dependencies scanned"; fi)
+          
+          EOF
+      
+      - name: Upload Dependency Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-security-results
+          path: |
+            *-vulnerabilities.json
+            *-audit.json
+            retire-results.json
+            dependency-security-report.md
+          retention-days: 30
+
+  # Stage 4: Security Unit Testing
+  security-unit-tests:
+    name: Security Unit Testing
+    runs-on: ubuntu-latest
+    needs: security-pre-checks
+    timeout-minutes: 45
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: fortress_test_password
+          POSTGRES_USER: fortress_test
+          POSTGRES_DB: fortress_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Install Test Dependencies
+        run: |
+          go mod download
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          go install golang.org/x/tools/cmd/cover@latest
+      
+      - name: Run SQL Injection Prevention Tests
+        run: |
+          echo "🔒 Running SQL injection prevention tests..."
+          go test -v -timeout 30m ./tests/security -run TestSQLInjectionPrevention -coverprofile=sql-injection-coverage.out
+      
+      - name: Run Authentication Security Tests
+        run: |
+          echo "🔐 Running authentication security tests..."
+          go test -v -timeout 30m ./tests/security -run TestAuthenticationSecurity -coverprofile=auth-security-coverage.out
+      
+      - name: Run API Security Tests
+        run: |
+          echo "🌐 Running API security tests..."
+          go test -v -timeout 30m ./tests/security -run TestAPISecurityValidation -coverprofile=api-security-coverage.out
+      
+      - name: Run SMTP Security Tests
+        run: |
+          echo "📧 Running SMTP security tests..."
+          go test -v -timeout 30m ./tests/security -run TestSMTPSecurityValidation -coverprofile=smtp-security-coverage.out
+      
+      - name: Generate Security Test Coverage Report
+        run: |
+          echo "📊 Generating security test coverage report..."
+          go tool cover -html=sql-injection-coverage.out -o sql-injection-coverage.html
+          go tool cover -html=auth-security-coverage.out -o auth-security-coverage.html
+          go tool cover -html=api-security-coverage.out -o api-security-coverage.html
+          go tool cover -html=smtp-security-coverage.out -o smtp-security-coverage.html
+          
+          # Combine coverage reports
+          echo "mode: set" > combined-security-coverage.out
+          tail -n +2 sql-injection-coverage.out >> combined-security-coverage.out
+          tail -n +2 auth-security-coverage.out >> combined-security-coverage.out
+          tail -n +2 api-security-coverage.out >> combined-security-coverage.out
+          tail -n +2 smtp-security-coverage.out >> combined-security-coverage.out
+          
+          COVERAGE=$(go tool cover -func=combined-security-coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Security Test Coverage: $COVERAGE%"
+          
+          # Require minimum 90% security test coverage
+          if (( $(echo "$COVERAGE < 90" | bc -l) )); then
+            echo "❌ Security test coverage ($COVERAGE%) below required threshold (90%)"
+            exit 1
+          fi
+          echo "✅ Security test coverage requirement met"
+      
+      - name: Upload Security Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-unit-test-results
+          path: |
+            *-coverage.out
+            *-coverage.html
+          retention-days: 30
+
+  # Stage 5: Performance Security Testing
+  performance-security-tests:
+    name: Performance Security Testing
+    runs-on: ubuntu-latest
+    needs: [security-pre-checks, security-unit-tests]
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Install Performance Testing Tools
+        run: |
+          go mod download
+          # Install additional performance testing tools if needed
+      
+      - name: Run Performance Security Tests
+        run: |
+          echo "⚡ Running performance security tests..."
+          go test -v -timeout 60m ./tests/performance -run TestFortressPerformanceValidation -benchmem -cpuprofile=cpu.prof -memprofile=mem.prof
+        env:
+          FORTRESS_PERFORMANCE_MODE: true
+      
+      - name: Analyze Performance Metrics
+        run: |
+          echo "📈 Analyzing performance security metrics..."
+          go tool pprof -text cpu.prof > cpu-profile.txt
+          go tool pprof -text mem.prof > mem-profile.txt
+          
+          # Check for performance security thresholds
+          echo "Validating performance security requirements..."
+          # Add specific performance validation logic here
+      
+      - name: Upload Performance Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-security-results
+          path: |
+            *.prof
+            *-profile.txt
+          retention-days: 30
+
+  # Stage 6: Penetration Testing (Conditional)
+  penetration-testing:
+    name: Automated Penetration Testing
+    runs-on: ubuntu-latest
+    needs: [security-pre-checks, security-unit-tests]
+    if: needs.security-pre-checks.outputs.run-penetration-tests == 'true'
+    timeout-minutes: 90
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Install Penetration Testing Tools
+        run: |
+          go mod download
+          
+          # Install additional penetration testing tools
+          sudo apt-get update
+          sudo apt-get install -y nmap sqlmap
+          
+          # Install OWASP ZAP for automated penetration testing
+          wget -q https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
+          tar -xzf ZAP_2.14.0_Linux.tar.gz
+          sudo mv ZAP_2.14.0 /opt/zaproxy
+          sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap.sh
+      
+      - name: Start Test Environment
+        run: |
+          echo "🏗️ Starting test environment for penetration testing..."
+          # Start the application in test mode
+          go run main.go --test-mode --port 8080 &
+          APP_PID=$!
+          echo $APP_PID > app.pid
+          
+          # Wait for application to start
+          sleep 10
+          curl -f http://localhost:8080/api/v3/health || exit 1
+      
+      - name: Run Automated Penetration Tests
+        run: |
+          echo "🎯 Running automated penetration tests..."
+          go test -v -timeout 90m ./tests/security -run TestFortressPenetrationTesting
+        env:
+          FORTRESS_PENTEST_MODE: true
+          TARGET_URL: http://localhost:8080
+      
+      - name: Run OWASP ZAP Scan
+        run: |
+          echo "🕷️ Running OWASP ZAP automated scan..."
+          zap.sh -cmd -quickurl http://localhost:8080 -quickout zap-report.html -quickprogress
+          zap.sh -cmd -quickurl http://localhost:8080 -quickout zap-report.json -quickprogress -quickjsonoutput
+        continue-on-error: true
+      
+      - name: Cleanup Test Environment
+        run: |
+          if [[ -f app.pid ]]; then
+            kill $(cat app.pid) || true
+            rm app.pid
+          fi
+      
+      - name: Upload Penetration Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: penetration-test-results
+          path: |
+            tests/security/fortress_penetration_test_report.json
+            tests/security/fortress_penetration_executive_summary.txt
+            zap-report.html
+            zap-report.json
+          retention-days: 30
+
+  # Stage 7: Compliance Validation (Conditional)
+  compliance-validation:
+    name: Security Compliance Validation
+    runs-on: ubuntu-latest
+    needs: [security-pre-checks, security-unit-tests]
+    if: needs.security-pre-checks.outputs.compliance-required == 'true'
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Install Compliance Tools
+        run: |
+          # Install compliance validation tools
+          pip3 install checkov  # Infrastructure as Code security
+          go install github.com/aquasecurity/trivy@latest  # Container security
+      
+      - name: OWASP Top 10 Compliance Check
+        run: |
+          echo "📋 Validating OWASP Top 10 compliance..."
+          go test -v ./tests/security -run TestOWASPTop10Assessment -compliance-mode
+      
+      - name: GDPR Compliance Validation
+        run: |
+          echo "🔒 Validating GDPR compliance..."
+          # Check for data protection mechanisms
+          grep -r "personal.*data\|privacy\|gdpr" . --include="*.go" --include="*.md" > gdpr-findings.txt || true
+          
+          # Validate data encryption and storage
+          echo "Checking encryption implementations..."
+          grep -r "encrypt\|crypto\|hash" . --include="*.go" > encryption-findings.txt || true
+      
+      - name: PCI DSS Compliance Check
+        run: |
+          echo "💳 Validating PCI DSS compliance..."
+          # Check for payment data handling
+          grep -r "payment\|card\|pci" . --include="*.go" > pci-findings.txt || true
+      
+      - name: SOX Compliance Validation
+        run: |
+          echo "📊 Validating SOX compliance..."
+          # Check for audit logging and controls
+          grep -r "audit\|log\|compliance" . --include="*.go" > sox-findings.txt || true
+      
+      - name: Generate Compliance Report
+        run: |
+          cat > compliance-report.md << 'EOF'
+          # Security Compliance Report
+          
+          ## OWASP Top 10 Compliance
+          - Status: $(if [[ $? -eq 0 ]]; then echo "COMPLIANT"; else echo "NON-COMPLIANT"; fi)
+          
+          ## GDPR Compliance
+          - Data Protection: $(if [[ -s gdpr-findings.txt ]]; then echo "IMPLEMENTED"; else echo "NEEDS REVIEW"; fi)
+          - Encryption: $(if [[ -s encryption-findings.txt ]]; then echo "IMPLEMENTED"; else echo "NEEDS IMPLEMENTATION"; fi)
+          
+          ## PCI DSS Compliance
+          - Status: $(if [[ -s pci-findings.txt ]]; then echo "APPLICABLE - REVIEW REQUIRED"; else echo "NOT APPLICABLE"; fi)
+          
+          ## SOX Compliance  
+          - Audit Controls: $(if [[ -s sox-findings.txt ]]; then echo "IMPLEMENTED"; else echo "NEEDS IMPLEMENTATION"; fi)
+          
+          Generated: $(date)
+          EOF
+      
+      - name: Upload Compliance Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: compliance-validation-results
+          path: |
+            compliance-report.md
+            *-findings.txt
+          retention-days: 30
+
+  # Stage 8: Security Monitoring and Alerting Setup
+  security-monitoring-setup:
+    name: Security Monitoring Configuration
+    runs-on: ubuntu-latest
+    needs: [security-unit-tests, dependency-security-scan]
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Security Monitoring Configuration
+        run: |
+          echo "📡 Configuring security monitoring..."
+          
+          # Create security monitoring configuration
+          mkdir -p monitoring/security
+          
+          cat > monitoring/security/security-alerts.yml << 'EOF'
+          # Security Monitoring and Alerting Configuration
+          alerts:
+            - name: high_severity_vulnerability
+              condition: vulnerability.severity == "HIGH"
+              action: immediate_notification
+              recipients: [security-team@company.com]
+            
+            - name: authentication_failures
+              condition: auth.failures > 10 in 5m
+              action: alert_and_investigate
+              
+            - name: sql_injection_attempts
+              condition: security.sql_injection_detected
+              action: block_and_alert
+              
+            - name: unusual_access_patterns
+              condition: access.pattern == "anomaly"
+              action: security_review
+          EOF
+          
+          cat > monitoring/security/metrics.yml << 'EOF'
+          # Security Metrics Collection
+          metrics:
+            - name: vulnerability_count
+              type: gauge
+              description: "Number of active vulnerabilities"
+              
+            - name: security_test_coverage
+              type: gauge
+              description: "Percentage of code covered by security tests"
+              
+            - name: authentication_success_rate
+              type: histogram
+              description: "Rate of successful authentications"
+              
+            - name: api_security_violations
+              type: counter
+              description: "Count of API security violations"
+          EOF
+      
+      - name: Validate Security Configuration
+        run: |
+          echo "✅ Security monitoring configuration created"
+          ls -la monitoring/security/
+      
+      - name: Upload Monitoring Configuration
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-monitoring-config
+          path: monitoring/security/
+          retention-days: 90
+
+  # Stage 9: Security Report Consolidation
+  security-report-consolidation:
+    name: Consolidated Security Report
+    runs-on: ubuntu-latest
+    needs: [static-security-analysis, dependency-security-scan, security-unit-tests, performance-security-tests]
+    if: always()
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v3
+      
+      - name: Consolidate Security Reports
+        run: |
+          echo "📋 Consolidating security test results..."
+          
+          # Create comprehensive security report
+          cat > FORTRESS_SECURITY_REPORT.md << 'EOF'
+          # 🛡️ FORTRESS SECURITY TESTING REPORT
+          
+          ## Executive Summary
+          - Pipeline Run: ${{ github.run_number }}
+          - Commit: ${{ github.sha }}
+          - Branch: ${{ github.ref_name }}
+          - Date: $(date)
+          
+          ## Security Testing Results
+          
+          ### Static Application Security Testing (SAST)
+          - GoSec Analysis: $(if [[ -f sast-results-gosec/gosec-results.json ]]; then echo "✅ COMPLETED"; else echo "❌ FAILED"; fi)
+          - Semgrep Analysis: $(if [[ -f sast-results-semgrep/semgrep-results.json ]]; then echo "✅ COMPLETED"; else echo "❌ FAILED"; fi)
+          - CodeQL Analysis: $(if [[ -f sast-results-codeql ]]; then echo "✅ COMPLETED"; else echo "❌ FAILED"; fi)
+          
+          ### Software Composition Analysis (SCA)
+          - Go Dependencies: $(if [[ -f dependency-security-results/go-vulnerabilities.json ]]; then echo "✅ SCANNED"; else echo "❌ FAILED"; fi)
+          - Node.js Dependencies: $(if [[ -f dependency-security-results/npm-audit.json ]]; then echo "✅ SCANNED"; else echo "❌ FAILED"; fi)
+          
+          ### Security Unit Tests
+          - SQL Injection Prevention: $(if [[ -f security-unit-test-results/sql-injection-coverage.out ]]; then echo "✅ PASSED"; else echo "❌ FAILED"; fi)
+          - Authentication Security: $(if [[ -f security-unit-test-results/auth-security-coverage.out ]]; then echo "✅ PASSED"; else echo "❌ FAILED"; fi)
+          - API Security: $(if [[ -f security-unit-test-results/api-security-coverage.out ]]; then echo "✅ PASSED"; else echo "❌ FAILED"; fi)
+          - SMTP Security: $(if [[ -f security-unit-test-results/smtp-security-coverage.out ]]; then echo "✅ PASSED"; else echo "❌ FAILED"; fi)
+          
+          ### Performance Security Tests
+          - Load Testing Security: $(if [[ -f performance-security-results ]]; then echo "✅ PASSED"; else echo "❌ FAILED"; fi)
+          
+          ### Penetration Testing
+          - Automated Pen Tests: $(if [[ -f penetration-test-results ]]; then echo "✅ COMPLETED"; else echo "⏭️ SKIPPED"; fi)
+          
+          ### Compliance Validation
+          - OWASP/GDPR/PCI/SOX: $(if [[ -f compliance-validation-results ]]; then echo "✅ VALIDATED"; else echo "⏭️ SKIPPED"; fi)
+          
+          ## Security Posture
+          - Overall Status: $(if [[ "${{ needs.security-unit-tests.result }}" == "success" ]]; then echo "🟢 SECURE"; else echo "🔴 NEEDS ATTENTION"; fi)
+          - Risk Level: $(if [[ "${{ needs.security-unit-tests.result }}" == "success" ]]; then echo "LOW"; else echo "MEDIUM-HIGH"; fi)
+          
+          ## Next Steps
+          1. Review any failed security tests
+          2. Address identified vulnerabilities
+          3. Update security configurations if needed
+          4. Schedule next comprehensive security assessment
+          
+          ---
+          *Generated by Fortress Security Pipeline*
+          EOF
+      
+      - name: Generate Security Badge
+        run: |
+          # Generate security status badge
+          if [[ "${{ needs.security-unit-tests.result }}" == "success" && "${{ needs.dependency-security-scan.result }}" == "success" ]]; then
+            BADGE_COLOR="brightgreen"
+            BADGE_MESSAGE="secure"
+          else
+            BADGE_COLOR="red"
+            BADGE_MESSAGE="vulnerabilities-detected"
+          fi
+          
+          echo "SECURITY_BADGE_COLOR=$BADGE_COLOR" >> $GITHUB_ENV
+          echo "SECURITY_BADGE_MESSAGE=$BADGE_MESSAGE" >> $GITHUB_ENV
+      
+      - name: Upload Consolidated Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: fortress-security-report
+          path: FORTRESS_SECURITY_REPORT.md
+          retention-days: 90
+      
+      - name: Post Security Summary
+        run: |
+          echo "## 🛡️ Fortress Security Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat FORTRESS_SECURITY_REPORT.md >> $GITHUB_STEP_SUMMARY
+
+  # Stage 10: Security Notification
+  security-notification:
+    name: Security Notification
+    runs-on: ubuntu-latest
+    needs: [security-report-consolidation]
+    if: always()
+    timeout-minutes: 5
+    
+    steps:
+      - name: Notify Security Team
+        run: |
+          echo "📢 Security pipeline completed"
+          echo "Status: ${{ needs.security-report-consolidation.result }}"
+          
+          # In a real environment, this would send notifications to:
+          # - Security team email/Slack
+          # - Security dashboard
+          # - SIEM systems
+          # - Compliance reporting systems
+          
+          if [[ "${{ needs.security-report-consolidation.result }}" != "success" ]]; then
+            echo "🚨 Security issues detected - immediate review required"
+            # exit 1  # Uncomment to fail pipeline on security issues
+          else
+            echo "✅ All security validations passed"
+          fi

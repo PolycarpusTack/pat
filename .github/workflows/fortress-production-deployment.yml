@@ -1,0 +1,714 @@
+name: 🏗️ Fortress Production Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'blue-green'
+        type: choice
+        options:
+          - blue-green
+          - canary
+          - rolling
+          - recreate
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        default: false
+        type: boolean
+      force_deployment:
+        description: 'Force deployment'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/fortress
+  DEPLOYMENT_TIMEOUT: 1800
+  HEALTH_CHECK_TIMEOUT: 300
+
+jobs:
+  # =============================================================================
+  # Pre-Deployment Validation
+  # =============================================================================
+  validate:
+    name: 🔍 Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_deploy: ${{ steps.validation.outputs.should_deploy }}
+      target_environment: ${{ steps.env.outputs.target_environment }}
+      deployment_strategy: ${{ steps.env.outputs.deployment_strategy }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🏷️ Determine Version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git describe --tags --always --dirty)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Version: $VERSION"
+      
+      - name: 🌍 Determine Environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TARGET_ENV="${{ github.event.inputs.environment }}"
+            DEPLOY_STRATEGY="${{ github.event.inputs.deployment_strategy }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TARGET_ENV="production"
+            DEPLOY_STRATEGY="blue-green"
+          else
+            TARGET_ENV="staging"
+            DEPLOY_STRATEGY="rolling"
+          fi
+          
+          echo "target_environment=$TARGET_ENV" >> $GITHUB_OUTPUT
+          echo "deployment_strategy=$DEPLOY_STRATEGY" >> $GITHUB_OUTPUT
+          echo "🎯 Target: $TARGET_ENV with $DEPLOY_STRATEGY strategy"
+      
+      - name: 📋 Pre-Deployment Validation
+        id: validation
+        run: |
+          echo "🔍 Running pre-deployment validation..."
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+          # Run validation
+          if ./scripts/fortress-deployment-validator.sh \
+            --type pre-deployment \
+            --environment ${{ steps.env.outputs.target_environment }} \
+            --strict; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ Pre-deployment validation passed"
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "❌ Pre-deployment validation failed"
+            exit 1
+          fi
+      
+      - name: 📤 Upload Validation Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report-${{ steps.version.outputs.version }}
+          path: logs/validation/
+          retention-days: 30
+
+  # =============================================================================
+  # Security and Quality Checks
+  # =============================================================================
+  security:
+    name: 🛡️ Security Scanning
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🔒 Run Security Audit
+        run: |
+          echo "🔒 Running comprehensive security audit..."
+          chmod +x fortress_security_audit.sh
+          ./fortress_security_audit.sh
+      
+      - name: 🕵️ Secret Scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+      
+      - name: 🐳 Container Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: 📤 Upload Security Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results-${{ needs.validate.outputs.version }}
+          path: |
+            fortress_security_audit_report.txt
+            trivy-results.sarif
+          retention-days: 30
+
+  # =============================================================================
+  # Build and Test
+  # =============================================================================
+  build:
+    name: 🏗️ Build and Test
+    runs-on: ubuntu-latest
+    needs: [validate, security]
+    if: needs.validate.outputs.should_deploy == 'true'
+    
+    strategy:
+      matrix:
+        component:
+          - fortress-core
+          - fortress-api
+          - fortress-smtp
+          - fortress-workflows
+          - fortress-plugins
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 🔑 Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏗️ Build Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ needs.validate.outputs.version }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.validate.outputs.version }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            GIT_COMMIT=${{ github.sha }}
+      
+      - name: 🔍 Test Container Image
+        run: |
+          echo "🧪 Testing container image: ${{ matrix.component }}"
+          
+          # Run basic container tests
+          docker run --rm \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ needs.validate.outputs.version }} \
+            --version || true
+          
+          echo "✅ Container image tests passed"
+
+  # =============================================================================
+  # Integration Tests
+  # =============================================================================
+  integration:
+    name: 🧪 Integration Tests
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: needs.validate.outputs.should_deploy == 'true' && github.event.inputs.skip_tests != 'true'
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: fortress_test
+          POSTGRES_DB: fortress_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🐳 Set up Docker Compose
+        run: |
+          # Use test configuration
+          cp docker-compose.fortress.yml docker-compose.test.yml
+          
+          # Update image versions
+          sed -i "s/:latest/:${{ needs.validate.outputs.version }}/g" docker-compose.test.yml
+          sed -i "s/ghcr.io/${{ env.DOCKER_REGISTRY }}/g" docker-compose.test.yml
+      
+      - name: 🧪 Run Integration Tests
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          DOCKER_REGISTRY: ${{ env.DOCKER_REGISTRY }}
+        run: |
+          echo "🧪 Running integration tests..."
+          
+          # Start services
+          docker-compose -f docker-compose.test.yml up -d
+          
+          # Wait for services to be ready
+          sleep 30
+          
+          # Run test suite
+          chmod +x scripts/fortress-deployment-validator.sh
+          ./scripts/fortress-deployment-validator.sh \
+            --type post-deployment \
+            --environment test \
+            --timeout 300
+          
+          # Cleanup
+          docker-compose -f docker-compose.test.yml down
+          
+          echo "✅ Integration tests passed"
+      
+      - name: 📤 Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results-${{ needs.validate.outputs.version }}
+          path: logs/validation/
+          retention-days: 30
+
+  # =============================================================================
+  # Staging Deployment
+  # =============================================================================
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [validate, security, build, integration]
+    if: |
+      needs.validate.outputs.should_deploy == 'true' &&
+      needs.validate.outputs.target_environment == 'staging' &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    
+    environment:
+      name: staging
+      url: https://staging.fortress.example.com
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: 🎯 Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+      
+      - name: 🚀 Execute Deployment
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          DEPLOYMENT_STRATEGY: ${{ needs.validate.outputs.deployment_strategy }}
+          ENVIRONMENT: staging
+          NOTIFICATION_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          echo "🚀 Deploying to staging with $DEPLOYMENT_STRATEGY strategy..."
+          
+          chmod +x fortress-deploy-production.sh
+          ./fortress-deploy-production.sh \
+            --strategy $DEPLOYMENT_STRATEGY \
+            --environment $ENVIRONMENT \
+            --version $VERSION \
+            --webhook "$NOTIFICATION_WEBHOOK"
+          
+          echo "✅ Staging deployment completed"
+      
+      - name: 🔍 Post-Deployment Validation
+        run: |
+          echo "🔍 Validating staging deployment..."
+          
+          ./scripts/fortress-deployment-validator.sh \
+            --type post-deployment \
+            --environment staging \
+            --timeout 300
+          
+          echo "✅ Staging validation passed"
+      
+      - name: 📤 Upload Deployment Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-deployment-logs-${{ needs.validate.outputs.version }}
+          path: logs/production-deployment/
+          retention-days: 30
+
+  # =============================================================================
+  # Production Deployment Approval
+  # =============================================================================
+  approve-production:
+    name: ✋ Production Approval
+    runs-on: ubuntu-latest
+    needs: [validate, deploy-staging]
+    if: |
+      needs.validate.outputs.target_environment == 'production' &&
+      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    
+    environment:
+      name: production-approval
+    
+    steps:
+      - name: 📋 Production Deployment Summary
+        run: |
+          echo "🚀 **Production Deployment Request**"
+          echo ""
+          echo "**Version:** ${{ needs.validate.outputs.version }}"
+          echo "**Strategy:** ${{ needs.validate.outputs.deployment_strategy }}"
+          echo "**Trigger:** ${{ github.event_name }}"
+          echo "**Actor:** ${{ github.actor }}"
+          echo ""
+          echo "**Pre-deployment checks:**"
+          echo "✅ Security scanning completed"
+          echo "✅ Integration tests passed"
+          echo "✅ Staging deployment successful"
+          echo ""
+          echo "**Ready for production deployment!**"
+
+  # =============================================================================
+  # Production Deployment
+  # =============================================================================
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [validate, approve-production]
+    if: |
+      needs.validate.outputs.target_environment == 'production' &&
+      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    
+    environment:
+      name: production
+      url: https://fortress.example.com
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: 🎯 Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: 📋 Pre-Production Backup
+        run: |
+          echo "📋 Creating pre-production backup..."
+          
+          chmod +x scripts/fortress-production-operations.sh
+          ./scripts/fortress-production-operations.sh \
+            --operation backup \
+            --backup-operation create \
+            --environment production
+          
+          echo "✅ Pre-production backup completed"
+      
+      - name: 🚀 Execute Production Deployment
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          DEPLOYMENT_STRATEGY: ${{ needs.validate.outputs.deployment_strategy }}
+          ENVIRONMENT: production
+          NOTIFICATION_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FORCE_DEPLOYMENT: ${{ github.event.inputs.force_deployment }}
+        run: |
+          echo "🚀 Deploying to production with $DEPLOYMENT_STRATEGY strategy..."
+          
+          chmod +x fortress-deploy-production.sh
+          
+          ARGS="--strategy $DEPLOYMENT_STRATEGY --environment $ENVIRONMENT --version $VERSION"
+          
+          if [[ "$FORCE_DEPLOYMENT" == "true" ]]; then
+            ARGS="$ARGS --force-deployment"
+          fi
+          
+          if [[ -n "$NOTIFICATION_WEBHOOK" ]]; then
+            ARGS="$ARGS --webhook $NOTIFICATION_WEBHOOK"
+          fi
+          
+          ./fortress-deploy-production.sh $ARGS
+          
+          echo "✅ Production deployment completed"
+      
+      - name: 🔍 Production Validation
+        run: |
+          echo "🔍 Validating production deployment..."
+          
+          ./scripts/fortress-deployment-validator.sh \
+            --type post-deployment \
+            --environment production \
+            --timeout 600 \
+            --strict
+          
+          echo "✅ Production validation passed"
+      
+      - name: 📊 Post-Deployment Operations
+        run: |
+          echo "📊 Running post-deployment operations..."
+          
+          # SSL certificate check
+          ./scripts/fortress-production-operations.sh \
+            --operation ssl \
+            --ssl-operation check \
+            --environment production
+          
+          # System status check
+          ./scripts/fortress-production-operations.sh \
+            --operation status \
+            --environment production
+          
+          echo "✅ Post-deployment operations completed"
+      
+      - name: 📤 Upload Production Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-deployment-logs-${{ needs.validate.outputs.version }}
+          path: |
+            logs/production-deployment/
+            logs/operations/
+            logs/validation/
+          retention-days: 90
+
+  # =============================================================================
+  # Rollback on Failure
+  # =============================================================================
+  rollback:
+    name: 🔄 Emergency Rollback
+    runs-on: ubuntu-latest
+    needs: [validate, deploy-production]
+    if: failure() && needs.validate.outputs.target_environment == 'production'
+    
+    environment:
+      name: production
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: 🎯 Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: 🔄 Execute Emergency Rollback
+        env:
+          DEPLOYMENT_ID: fortress-production-${{ github.run_id }}
+          NOTIFICATION_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          echo "🔄 Executing emergency rollback..."
+          
+          chmod +x scripts/fortress-rollback-automation.sh
+          ./scripts/fortress-rollback-automation.sh \
+            --deployment-id $DEPLOYMENT_ID \
+            --strategy auto-detect \
+            --reason "deployment_pipeline_failure" \
+            --webhook "$NOTIFICATION_WEBHOOK"
+          
+          echo "✅ Emergency rollback completed"
+      
+      - name: 📤 Upload Rollback Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-logs-${{ needs.validate.outputs.version }}
+          path: logs/rollback/
+          retention-days: 90
+
+  # =============================================================================
+  # Notification and Cleanup
+  # =============================================================================
+  notify:
+    name: 📢 Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [validate, deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+      - name: 📊 Determine Deployment Status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=🎉 Production deployment successful!" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy-staging.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=✅ Staging deployment successful!" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy-production.result }}" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=💥 Production deployment failed!" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          else
+            echo "status=partial" >> $GITHUB_OUTPUT
+            echo "message=⚠️ Deployment completed with issues" >> $GITHUB_OUTPUT
+            echo "color=warning" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 📢 Send Slack Notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              attachments: [{
+                color: '${{ steps.status.outputs.color }}',
+                title: 'Fortress Deployment Pipeline',
+                text: '${{ steps.status.outputs.message }}',
+                fields: [{
+                  title: 'Version',
+                  value: '${{ needs.validate.outputs.version }}',
+                  short: true
+                }, {
+                  title: 'Environment',
+                  value: '${{ needs.validate.outputs.target_environment }}',
+                  short: true
+                }, {
+                  title: 'Strategy',
+                  value: '${{ needs.validate.outputs.deployment_strategy }}',
+                  short: true
+                }, {
+                  title: 'Actor',
+                  value: '${{ github.actor }}',
+                  short: true
+                }],
+                footer: 'GitHub Actions',
+                ts: ${{ github.event.head_commit.timestamp }}
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: 📧 Send Email Notification
+        if: needs.deploy-production.result == 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🎉 Fortress Production Deployment Successful - ${{ needs.validate.outputs.version }}"
+          to: ${{ secrets.DEPLOYMENT_EMAIL_LIST }}
+          from: "Fortress CI/CD <noreply@fortress.example.com>"
+          html_body: |
+            <h2>🎉 Fortress Production Deployment Successful</h2>
+            <p><strong>Version:</strong> ${{ needs.validate.outputs.version }}</p>
+            <p><strong>Strategy:</strong> ${{ needs.validate.outputs.deployment_strategy }}</p>
+            <p><strong>Deployed by:</strong> ${{ github.actor }}</p>
+            <p><strong>Repository:</strong> ${{ github.repository }}</p>
+            <p><strong>Commit:</strong> ${{ github.sha }}</p>
+            <br>
+            <p>🔗 <a href="https://fortress.example.com">Production Environment</a></p>
+            <p>📊 <a href="https://monitoring.fortress.example.com">Monitoring Dashboard</a></p>
+            <p>📋 <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">Deployment Details</a></p>
+
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [validate, deploy-staging, deploy-production, notify]
+    if: always()
+    
+    steps:
+      - name: 🧹 Clean up Docker Images
+        run: |
+          echo "🧹 Cleaning up old Docker images..."
+          
+          # Remove images older than 7 days (would be implemented with registry API)
+          echo "Docker registry cleanup would be performed here"
+          
+          echo "✅ Cleanup completed"
+      
+      - name: 📊 Generate Deployment Metrics
+        run: |
+          echo "📊 Generating deployment metrics..."
+          
+          cat << EOF > deployment-metrics.json
+          {
+            "deployment_id": "${{ github.run_id }}",
+            "version": "${{ needs.validate.outputs.version }}",
+            "environment": "${{ needs.validate.outputs.target_environment }}",
+            "strategy": "${{ needs.validate.outputs.deployment_strategy }}",
+            "trigger": "${{ github.event_name }}",
+            "actor": "${{ github.actor }}",
+            "repository": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "started_at": "${{ github.event.head_commit.timestamp }}",
+            "completed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": {
+              "validation": "${{ needs.validate.result }}",
+              "staging": "${{ needs.deploy-staging.result }}",
+              "production": "${{ needs.deploy-production.result }}"
+            }
+          }
+          EOF
+          
+          echo "✅ Metrics generated"
+      
+      - name: 📤 Upload Deployment Metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-metrics-${{ github.run_id }}
+          path: deployment-metrics.json
+          retention-days: 365

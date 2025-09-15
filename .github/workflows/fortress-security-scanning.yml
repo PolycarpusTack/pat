@@ -1,0 +1,373 @@
+name: 'Fortress Security Scanning & Dependency Updates'
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC for dependency scanning
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force dependency updates'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  GO_VERSION: '1.21'
+  NODE_VERSION: '18'
+
+jobs:
+  # ================================
+  # Go Security Scanning
+  # ================================
+  go-security-scan:
+    name: 'Go Dependencies Security Scan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          
+      - name: Download Go modules
+        run: go mod download
+        
+      - name: Run Go vulnerability scanner
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+          
+      - name: Run Nancy security scanner
+        run: |
+          go install github.com/sonatypecommunity/nancy@latest
+          go list -json -deps ./... | nancy sleuth
+          
+      - name: Run Snyk security scan
+        uses: snyk/actions/golang@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --fail-on=upgradable
+          
+      - name: Upload Snyk results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  # ================================
+  # Node.js Security Scanning
+  # ================================
+  node-security-scan:
+    name: 'Node.js Dependencies Security Scan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+        
+      - name: Run npm audit
+        working-directory: ./frontend
+        run: |
+          npm audit --audit-level=high --production
+          npm audit fix --dry-run
+          
+      - name: Run Node.js Snyk scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high frontend/
+          
+      - name: Upload Node Snyk results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  # ================================
+  # Docker Security Scanning
+  # ================================
+  docker-security-scan:
+    name: 'Docker Images Security Scan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      
+    strategy:
+      matrix:
+        dockerfile:
+          - { path: "Dockerfile.fortress-core", image: "fortress-core" }
+          - { path: "Dockerfile.api", image: "fortress-api" }
+          - { path: "Dockerfile.smtp", image: "fortress-smtp" }
+          - { path: "Dockerfile.plugins", image: "fortress-plugins" }
+          - { path: "Dockerfile.workflows", image: "fortress-workflows" }
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Build Docker image for scanning
+        run: |
+          docker build -f ${{ matrix.dockerfile.path }} \
+            -t fortress-security-scan:${{ matrix.dockerfile.image }} \
+            --target production .
+            
+      - name: Run Trivy security scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'fortress-security-scan:${{ matrix.dockerfile.image }}'
+          format: 'sarif'
+          output: 'trivy-${{ matrix.dockerfile.image }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-${{ matrix.dockerfile.image }}.sarif'
+          
+      - name: Run Docker Scout
+        if: always()
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh -s --
+          docker scout cves fortress-security-scan:${{ matrix.dockerfile.image }} \
+            --format sarif --output docker-scout-${{ matrix.dockerfile.image }}.sarif
+            
+      - name: Upload Docker Scout results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'docker-scout-${{ matrix.dockerfile.image }}.sarif'
+
+  # ================================
+  # Infrastructure Security Scanning
+  # ================================
+  infrastructure-security-scan:
+    name: 'Infrastructure Security Scan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Run Checkov for IaC security
+        uses: bridgecrewio/checkov-action@master
+        with:
+          framework: dockerfile,docker_compose,kubernetes
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          
+      - name: Run TruffleHog secrets scanner
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/pwd" \
+            trufflesecurity/trufflehog:latest github \
+            --repo https://github.com/${{ github.repository }} \
+            --branch ${{ github.ref_name }} \
+            --json > trufflehog-results.json
+            
+      - name: Process TruffleHog results
+        if: always()
+        run: |
+          if [ -s trufflehog-results.json ]; then
+            echo "::error::Secrets detected in repository"
+            cat trufflehog-results.json
+            exit 1
+          fi
+
+  # ================================
+  # Automated Dependency Updates
+  # ================================
+  automated-dependency-updates:
+    name: 'Automated Security Updates'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.inputs.force_update == 'true'
+    permissions:
+      contents: write
+      pull-requests: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Update Go dependencies
+        run: |
+          # Update Go modules to latest secure versions
+          go get -u ./...
+          go mod tidy
+          
+          # Verify no vulnerabilities
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+          
+      - name: Update Node.js dependencies
+        working-directory: ./frontend
+        run: |
+          # Update to latest secure versions
+          npm update --save
+          npm audit fix --force
+          
+          # Verify no high/critical vulnerabilities remain
+          npm audit --audit-level=high --production
+          
+      - name: Update Docker base images
+        run: |
+          # Update Docker base images to latest secure versions
+          sed -i 's/postgres:15\..*-alpine/postgres:15.9-alpine/g' docker-compose*.yml
+          sed -i 's/redis:7\..*-alpine/redis:7.4-alpine/g' docker-compose*.yml
+          sed -i 's/node:18\..*-alpine/node:18.20-alpine/g' Dockerfile*
+          sed -i 's/golang:1\.21\..*-alpine/golang:1.21.13-alpine/g' Dockerfile*
+          
+      - name: Run tests to verify updates
+        run: |
+          # Run Go tests
+          go test -v ./...
+          
+          # Run Node.js tests
+          cd frontend && npm test -- --passWithNoTests
+          
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          commit-message: |
+            chore: automated security dependency updates
+            
+            - Updated Go dependencies to latest secure versions
+            - Updated Node.js dependencies with security fixes
+            - Updated Docker base images to latest secure versions
+            - Verified all tests pass with updated dependencies
+          title: 'chore: automated security dependency updates'
+          body: |
+            ## Automated Security Dependency Updates
+            
+            This PR contains automated security updates for dependencies:
+            
+            ### Go Dependencies
+            - Updated all Go modules to latest secure versions
+            - Verified no vulnerabilities with govulncheck
+            
+            ### Node.js Dependencies  
+            - Updated frontend dependencies with security fixes
+            - Applied npm audit fixes for high/critical vulnerabilities
+            
+            ### Docker Images
+            - Updated base images to latest secure versions
+            - PostgreSQL: Updated to 15.9-alpine
+            - Redis: Updated to 7.4-alpine
+            - Node.js: Updated to 18.20-alpine
+            - Go: Updated to 1.21.13-alpine
+            
+            ### Verification
+            - [x] All tests pass
+            - [x] No high/critical vulnerabilities remain
+            - [x] Build succeeds with updated dependencies
+            
+            **Auto-generated by Fortress Security Automation**
+          branch: automated-security-updates
+          delete-branch: true
+          
+  # ================================
+  # Security Compliance Report
+  # ================================
+  security-compliance-report:
+    name: 'Security Compliance Report'
+    runs-on: ubuntu-latest
+    needs: [go-security-scan, node-security-scan, docker-security-scan, infrastructure-security-scan]
+    if: always()
+    permissions:
+      contents: read
+      security-events: write
+      
+    steps:
+      - name: Generate security summary
+        run: |
+          echo "## Fortress Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scan Status" >> $GITHUB_STEP_SUMMARY
+          echo "- Go Security Scan: ${{ needs.go-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Node.js Security Scan: ${{ needs.node-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker Security Scan: ${{ needs.docker-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Infrastructure Security Scan: ${{ needs.infrastructure-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Security Compliance" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.go-security-scan.result }}" == "success" && \
+                "${{ needs.node-security-scan.result }}" == "success" && \
+                "${{ needs.docker-security-scan.result }}" == "success" && \
+                "${{ needs.infrastructure-security-scan.result }}" == "success" ]]; then
+            echo "✅ **ALL SECURITY SCANS PASSED**" >> $GITHUB_STEP_SUMMARY
+            echo "🔒 **FORTRESS IS SECURE FOR DEPLOYMENT**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **SECURITY ISSUES DETECTED**" >> $GITHUB_STEP_SUMMARY
+            echo "🚫 **DEPLOYMENT BLOCKED UNTIL RESOLVED**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Notify security team on failures
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#fortress-security'
+          webhook_url: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+          text: |
+            🚨 **FORTRESS SECURITY ALERT** 🚨
+            
+            Critical security issues detected in Pat Fortress:
+            - Repository: ${{ github.repository }}
+            - Branch: ${{ github.ref }}
+            - Commit: ${{ github.sha }}
+            
+            Immediate attention required!

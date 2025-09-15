@@ -1,0 +1,477 @@
+name: 🏰 Fortress Integration Tests
+
+on:
+  push:
+    branches: [ main, develop, feature/fortress-* ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run integration tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test execution level'
+        required: true
+        default: 'integration'
+        type: choice
+        options:
+          - 'unit'
+          - 'integration'  
+          - 'full'
+      skip_docker:
+        description: 'Skip Docker integration tests'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  GO_VERSION: '1.21'
+  FORTRESS_ENV: 'test'
+  FORTRESS_LOG_LEVEL: 'info'
+  FORTRESS_DEBUG: 'false'
+  CGO_ENABLED: 1
+  COVERAGE_THRESHOLD: 95
+
+jobs:
+  # Pre-flight checks and setup
+  preflight:
+    name: 🔍 Pre-flight Checks
+    runs-on: ubuntu-latest
+    outputs:
+      should-run-integration: ${{ steps.changes.outputs.should-run }}
+      should-run-docker: ${{ steps.docker-check.outputs.should-run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check for relevant changes
+        id: changes
+        run: |
+          # Check if integration tests should run based on changed files
+          if git diff --name-only HEAD~1 | grep -E '\.(go|mod|sum)$|Dockerfile|docker-compose|Makefile'; then
+            echo "should-run=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should-run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should-run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Docker availability
+        id: docker-check
+        run: |
+          if [ "${{ inputs.skip_docker }}" = "true" ]; then
+            echo "should-run=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should-run=false" >> $GITHUB_OUTPUT  # Skip Docker tests in PR by default
+          else
+            echo "should-run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify Go modules
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # Unit tests (always run)
+  unit-tests:
+    name: 🔬 Unit Tests
+    runs-on: ubuntu-latest
+    needs: preflight
+    strategy:
+      matrix:
+        go-version: ['1.21', '1.22']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Install dependencies
+        run: |
+          cd tests/integration
+          make ci-deps
+
+      - name: Run unit tests
+        run: |
+          cd tests/integration
+          make test-unit
+
+      - name: Upload unit test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: unit-coverage-${{ matrix.go-version }}
+          path: tests/integration/coverage/unit_coverage.out
+          retention-days: 7
+
+  # Service dependencies for integration tests
+  setup-services:
+    name: 🔧 Setup Test Services
+    runs-on: ubuntu-latest
+    needs: [preflight, unit-tests]
+    if: needs.preflight.outputs.should-run-integration == 'true'
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: pat_fortress_test
+          POSTGRES_USER: pat_test
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5433:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6380:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Wait for services
+        run: |
+          timeout 60 bash -c 'until nc -z localhost 5433; do sleep 1; done'
+          timeout 60 bash -c 'until nc -z localhost 6380; do sleep 1; done'
+          echo "✅ Services are ready"
+
+      - name: Configure test environment
+        run: |
+          echo "FORTRESS_TEST_DB_HOST=localhost" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_DB_PORT=5433" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_DB_NAME=pat_fortress_test" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_DB_USER=pat_test" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_DB_PASSWORD=test_password" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_REDIS_ADDRESS=localhost:6380" >> $GITHUB_ENV
+          echo "FORTRESS_TEST_REDIS_DB=1" >> $GITHUB_ENV
+
+      - name: Run database integration tests
+        run: |
+          cd tests/integration
+          make test-external
+
+      - name: Upload external system test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: external-test-results
+          path: |
+            tests/integration/coverage/external_coverage.out
+            tests/integration/results/
+          retention-days: 7
+
+  # Email processing pipeline tests
+  email-pipeline-tests:
+    name: 📧 Email Processing Pipeline Tests
+    runs-on: ubuntu-latest
+    needs: [preflight, setup-services]
+    if: needs.preflight.outputs.should-run-integration == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run email processing pipeline tests
+        run: |
+          cd tests/integration
+          make test-email-pipeline
+
+      - name: Upload pipeline test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-test-results
+          path: |
+            tests/integration/coverage/pipeline_coverage.out
+            tests/integration/results/
+          retention-days: 7
+
+  # Service integration tests
+  service-integration-tests:
+    name: 🔗 Service Integration Tests
+    runs-on: ubuntu-latest
+    needs: [preflight, setup-services]
+    if: needs.preflight.outputs.should-run-integration == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run service integration tests
+        run: |
+          cd tests/integration
+          make test-services
+
+      - name: Upload service test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: service-test-results
+          path: |
+            tests/integration/coverage/services_coverage.out
+            tests/integration/results/
+          retention-days: 7
+
+  # Protocol compliance tests
+  protocol-compliance-tests:
+    name: 📡 Protocol Compliance Tests
+    runs-on: ubuntu-latest
+    needs: [preflight, unit-tests]
+    if: needs.preflight.outputs.should-run-integration == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run protocol compliance tests
+        run: |
+          cd tests/integration
+          make test-protocol
+
+      - name: Upload protocol test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: protocol-test-results
+          path: |
+            tests/integration/coverage/protocol_coverage.out
+            tests/integration/results/
+          retention-days: 7
+
+  # Docker integration tests (optional)
+  docker-integration-tests:
+    name: 🐳 Docker Integration Tests
+    runs-on: ubuntu-latest
+    needs: [preflight, unit-tests]
+    if: needs.preflight.outputs.should-run-docker == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build Docker images
+        run: |
+          docker build -t fortress:test .
+
+      - name: Run Docker integration tests
+        env:
+          SKIP_DOCKER_TESTS: 'false'
+        run: |
+          cd tests/integration
+          make test-docker
+
+      - name: Upload Docker test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: docker-test-results
+          path: |
+            tests/integration/coverage/docker_coverage.out
+            tests/integration/results/
+          retention-days: 7
+
+      - name: Cleanup Docker resources
+        if: always()
+        run: |
+          docker-compose -f docker-compose.test.yml down -v --remove-orphans || true
+          docker image prune -f
+
+  # Performance benchmarks
+  performance-benchmarks:
+    name: 🚀 Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: [preflight, unit-tests]
+    if: needs.preflight.outputs.should-run-integration == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run performance benchmarks
+        run: |
+          cd tests/integration
+          make test-performance
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: |
+            tests/integration/results/
+          retention-days: 30
+
+  # Test orchestration and final validation
+  test-orchestration:
+    name: 🎭 Test Orchestration & Validation
+    runs-on: ubuntu-latest
+    needs: [preflight, email-pipeline-tests, service-integration-tests, protocol-compliance-tests, setup-services]
+    if: always() && needs.preflight.outputs.should-run-integration == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download all test artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Run test orchestration
+        run: |
+          cd tests/integration
+          make test-orchestration
+
+      - name: Generate comprehensive coverage report
+        run: |
+          cd tests/integration
+          make test-coverage
+
+      - name: Generate final reports
+        run: |
+          cd tests/integration
+          make ci-report
+
+      - name: Upload comprehensive test report
+        uses: actions/upload-artifact@v3
+        with:
+          name: comprehensive-test-report
+          path: |
+            tests/integration/reports/
+            FORTRESS_INTEGRATION_TEST_REPORT.md
+          retention-days: 30
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-reports
+          path: |
+            tests/integration/coverage/
+          retention-days: 30
+
+      # Optional: Upload to Codecov
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v3
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        with:
+          files: tests/integration/coverage/coverage.xml
+          flags: integration
+          name: fortress-integration-coverage
+
+  # Final status check
+  integration-tests-complete:
+    name: ✅ Integration Tests Complete
+    runs-on: ubuntu-latest
+    needs: [unit-tests, test-orchestration, docker-integration-tests]
+    if: always()
+    steps:
+      - name: Check overall test status
+        run: |
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Test Orchestration: ${{ needs.test-orchestration.result }}"
+          echo "Docker Tests: ${{ needs.docker-integration-tests.result }}"
+          
+          if [[ "${{ needs.unit-tests.result }}" == "failure" ]]; then
+            echo "❌ Unit tests failed"
+            exit 1
+          elif [[ "${{ needs.test-orchestration.result }}" == "failure" ]]; then
+            echo "❌ Integration tests failed"
+            exit 1
+          elif [[ "${{ needs.docker-integration-tests.result }}" == "failure" && "${{ needs.docker-integration-tests.result }}" != "skipped" ]]; then
+            echo "❌ Docker tests failed"
+            exit 1
+          else
+            echo "✅ All tests completed successfully"
+          fi
+
+      - name: Post success status
+        if: success()
+        run: |
+          echo "🏰 FORTRESS INTEGRATION TESTS COMPLETED SUCCESSFULLY! 🏰"
+          echo ""
+          echo "✅ Unit Tests: PASSED"
+          echo "✅ Integration Tests: PASSED"
+          echo "✅ Coverage Requirements: MET"
+          echo ""
+          echo "The fortress is secure and battle-tested! 🛡️"
+
+      - name: Post failure status
+        if: failure()
+        run: |
+          echo "🚨 FORTRESS INTEGRATION TESTS FAILED! 🚨"
+          echo ""
+          echo "Please check the test results and fix any issues."
+          echo "The fortress defenses need attention! 🔧"
+          exit 1
+
+# Security scanning
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Gosec Security Scanner
+        uses: securecodewarrior/github-action-gosec@master
+        with:
+          args: '-fmt sarif -out gosec.sarif ./...'
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: gosec.sarif

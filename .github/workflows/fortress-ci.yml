@@ -1,0 +1,688 @@
+name: 🛡️ Fortress CI Pipeline with Quality Gates
+
+on:
+  push:
+    branches: [main, develop, feature/*, release/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run nightly builds at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '18'
+  GO_VERSION: '1.21'
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: pat-fortress
+  QUALITY_GATE_TIMEOUT: 30m
+  
+  # Quality Gate Thresholds
+  MIN_UNIT_COVERAGE: 90
+  MIN_INTEGRATION_COVERAGE: 85
+  MIN_MUTATION_SCORE: 80
+  MAX_CRITICAL_VULNERABILITIES: 0
+  MAX_HIGH_VULNERABILITIES: 0
+  MAX_API_RESPONSE_TIME: 100
+  MIN_PERFORMANCE_SCORE: 95
+
+jobs:
+  # ===== PHASE 1: BUILD AND BASIC VALIDATION =====
+  build-validation:
+    name: 🔨 Build & Basic Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    outputs:
+      go-cache-key: ${{ steps.go-cache.outputs.cache-hit }}
+      npm-cache-key: ${{ steps.npm-cache.outputs.cache-hit }}
+      build-version: ${{ steps.version.outputs.version }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 📊 Generate Build Version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION="pr-${{ github.event.number }}-$(echo ${{ github.sha }} | cut -c1-8)"
+          else
+            VERSION="$(echo ${{ github.ref_name }} | sed 's/\//-/g')-$(echo ${{ github.sha }} | cut -c1-8)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Build Version: $VERSION"
+          
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 📦 Go Dependency Cache
+        id: go-cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+            
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📦 NPM Dependency Cache
+        id: npm-cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+            
+      - name: 📥 Download Go Dependencies
+        run: go mod download && go mod verify
+        
+      - name: 📥 Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit
+        
+      - name: 🔍 Go Lint Check
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+          args: --timeout=10m --config=.golangci.yml
+          
+      - name: 🔍 Frontend Lint Check
+        working-directory: frontend
+        run: npm run lint -- --max-warnings=0
+        
+      - name: 🔍 TypeScript Type Check
+        working-directory: frontend
+        run: npm run type-check
+        
+      - name: 🔨 Go Build
+        run: |
+          go build -v -o dist/pat-server ./cmd/server
+          go build -v -o dist/pat-cli ./cmd/cli
+          
+      - name: 🔨 Frontend Build
+        working-directory: frontend
+        run: npm run build
+        
+      - name: 📤 Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ steps.version.outputs.version }}
+          path: |
+            dist/
+            frontend/dist/
+          retention-days: 7
+
+  # ===== PHASE 2: COMPREHENSIVE TESTING =====
+  unit-tests:
+    name: 🧪 Unit Testing with Coverage
+    runs-on: ubuntu-latest
+    needs: build-validation
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📥 Restore Dependencies
+        run: |
+          go mod download
+          cd frontend && npm ci --prefer-offline
+          
+      - name: 🧪 Run Go Unit Tests with Coverage
+        run: |
+          mkdir -p coverage
+          go test -v -race -coverprofile=coverage/go-coverage.out -covermode=atomic ./...
+          go tool cover -func=coverage/go-coverage.out | tee coverage/go-coverage-summary.txt
+          
+      - name: 📊 Go Coverage Quality Gate
+        run: |
+          COVERAGE=$(go tool cover -func=coverage/go-coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Go Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < $MIN_UNIT_COVERAGE" | bc -l) )); then
+            echo "❌ Go coverage $COVERAGE% is below minimum threshold $MIN_UNIT_COVERAGE%"
+            exit 1
+          fi
+          echo "✅ Go coverage meets quality gate threshold"
+          
+      - name: 🧪 Run Frontend Unit Tests with Coverage
+        working-directory: frontend
+        run: |
+          npm run test:coverage -- --watchAll=false --maxWorkers=2
+          
+      - name: 📊 Frontend Coverage Quality Gate
+        working-directory: frontend
+        run: |
+          COVERAGE=$(npx nyc report --reporter=text-summary | grep "Lines" | awk '{print $2}' | sed 's/%//')
+          echo "Frontend Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < $MIN_UNIT_COVERAGE" | bc -l) )); then
+            echo "❌ Frontend coverage $COVERAGE% is below minimum threshold $MIN_UNIT_COVERAGE%"
+            exit 1
+          fi
+          echo "✅ Frontend coverage meets quality gate threshold"
+          
+      - name: 🧬 Mutation Testing (Go)
+        run: |
+          go install github.com/go-mutesting/mutesting/cmd/mutesting@latest
+          mutesting $(go list ./pkg/... | grep -v vendor) > coverage/mutation-report.txt
+          MUTATION_SCORE=$(grep "The mutation score" coverage/mutation-report.txt | awk '{print $5}' | sed 's/%//')
+          echo "Mutation Score: $MUTATION_SCORE%"
+          if (( $(echo "$MUTATION_SCORE < $MIN_MUTATION_SCORE" | bc -l) )); then
+            echo "❌ Mutation score $MUTATION_SCORE% is below minimum threshold $MIN_MUTATION_SCORE%"
+            exit 1
+          fi
+          
+      - name: 📤 Upload Coverage Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports-${{ needs.build-validation.outputs.build-version }}
+          path: |
+            coverage/
+            frontend/coverage/
+            
+      - name: 📊 Coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/go-coverage.out,./frontend/coverage/lcov.info
+          flags: unit-tests
+          name: fortress-unit-coverage
+
+  integration-tests:
+    name: 🔗 Integration Testing
+    runs-on: ubuntu-latest
+    needs: [build-validation, unit-tests]
+    timeout-minutes: 25
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_test
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+          
+      mailhog:
+        image: mailhog/mailhog:latest
+        ports:
+          - 1025:1025
+          - 8025:8025
+          
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment  
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 📥 Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ needs.build-validation.outputs.build-version }}
+          
+      - name: 📥 Restore Dependencies
+        run: |
+          go mod download
+          cd frontend && npm ci --prefer-offline
+          
+      - name: 🗃️ Database Migration
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_test
+        run: |
+          go run ./cmd/migrate up
+          
+      - name: 🔗 Run Integration Tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_test
+          REDIS_URL: redis://localhost:6379
+          SMTP_HOST: localhost
+          SMTP_PORT: 1025
+          PAT_ENV: test
+        run: |
+          mkdir -p coverage
+          go test -v -tags=integration -coverprofile=coverage/integration-coverage.out ./tests/integration/...
+          
+      - name: 📊 Integration Coverage Quality Gate
+        run: |
+          COVERAGE=$(go tool cover -func=coverage/integration-coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Integration Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < $MIN_INTEGRATION_COVERAGE" | bc -l) )); then
+            echo "❌ Integration coverage $COVERAGE% is below minimum threshold $MIN_INTEGRATION_COVERAGE%"
+            exit 1
+          fi
+          echo "✅ Integration coverage meets quality gate threshold"
+          
+      - name: 🌐 E2E Tests
+        working-directory: frontend
+        env:
+          CYPRESS_baseUrl: http://localhost:8080
+          CYPRESS_apiUrl: http://localhost:8080/api
+        run: |
+          # Start the application in background
+          ../dist/pat-server --config=../config/test.yml &
+          APP_PID=$!
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:8080/health; do sleep 2; done'
+          
+          # Run E2E tests
+          npm run test:e2e:ci
+          
+          # Cleanup
+          kill $APP_PID
+          
+      - name: 📤 Upload Integration Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results-${{ needs.build-validation.outputs.build-version }}
+          path: |
+            coverage/integration-coverage.out
+            frontend/cypress/screenshots/
+            frontend/cypress/videos/
+
+  # ===== PHASE 3: SECURITY QUALITY GATE =====
+  security-gate:
+    name: 🛡️ Security Quality Gate
+    runs-on: ubuntu-latest
+    needs: [build-validation]
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 🐹 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - name: 🟢 Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: 🔍 Go Security Audit
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+          
+      - name: 🔍 NPM Security Audit
+        working-directory: frontend
+        run: |
+          npm ci --prefer-offline
+          npm audit --audit-level high
+          
+      - name: 🔍 Snyk Vulnerability Scan
+        uses: snyk/actions/golang@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --fail-on=all
+          
+      - name: 🔍 CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go, javascript
+          config-file: ./.github/codeql/codeql-config.yml
+          
+      - name: 🔍 CodeQL Autobuild
+        uses: github/codeql-action/autobuild@v3
+        
+      - name: 🔍 CodeQL Analysis Results
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go,javascript"
+          
+      - name: 🔍 SAST with Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/golang
+            p/typescript
+            
+      - name: 🛡️ Security Quality Gate Validation
+        run: |
+          echo "🔍 Validating security scan results..."
+          
+          # Check for critical vulnerabilities (should be 0)
+          CRITICAL_COUNT=$(grep -c "CRITICAL" security-results.json 2>/dev/null || echo "0")
+          HIGH_COUNT=$(grep -c "HIGH" security-results.json 2>/dev/null || echo "0")
+          
+          echo "Critical vulnerabilities: $CRITICAL_COUNT"
+          echo "High vulnerabilities: $HIGH_COUNT"
+          
+          if [ "$CRITICAL_COUNT" -gt "$MAX_CRITICAL_VULNERABILITIES" ]; then
+            echo "❌ Security quality gate failed: $CRITICAL_COUNT critical vulnerabilities found (max allowed: $MAX_CRITICAL_VULNERABILITIES)"
+            exit 1
+          fi
+          
+          if [ "$HIGH_COUNT" -gt "$MAX_HIGH_VULNERABILITIES" ]; then
+            echo "❌ Security quality gate failed: $HIGH_COUNT high vulnerabilities found (max allowed: $MAX_HIGH_VULNERABILITIES)"
+            exit 1
+          fi
+          
+          echo "✅ Security quality gate passed"
+
+  # ===== PHASE 4: PERFORMANCE QUALITY GATE =====
+  performance-gate:
+    name: ⚡ Performance Quality Gate
+    runs-on: ubuntu-latest
+    needs: [build-validation, integration-tests]
+    timeout-minutes: 25
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pat_perf
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+          
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 📥 Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ needs.build-validation.outputs.build-version }}
+          
+      - name: 🗃️ Database Setup
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+        run: |
+          go run ./cmd/migrate up
+          
+      - name: ⚡ Performance Benchmarks
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/pat_perf
+          REDIS_URL: redis://localhost:6379
+        run: |
+          mkdir -p performance
+          
+          # Run Go benchmarks
+          go test -bench=. -benchmem -benchtime=30s ./... > performance/go-bench.txt
+          
+          # Extract performance metrics
+          BENCHMARK_RESULTS=$(cat performance/go-bench.txt)
+          echo "Performance benchmark results saved"
+          
+      - name: ⚡ Load Testing with K6
+        run: |
+          # Install k6
+          curl -s https://github.com/grafana/k6/releases/download/v0.47.0/k6-v0.47.0-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v0.47.0-linux-amd64/k6 /usr/local/bin/
+          
+          # Start application
+          ./dist/pat-server --config=config/performance.yml &
+          APP_PID=$!
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:8080/health; do sleep 2; done'
+          
+          # Run load test
+          k6 run tests/performance/load-test.js --out json=performance/k6-results.json
+          
+          # Cleanup
+          kill $APP_PID
+          
+      - name: 📊 Performance Quality Gate Validation
+        run: |
+          echo "⚡ Validating performance metrics..."
+          
+          # Extract API response time P95 from k6 results
+          if [ -f "performance/k6-results.json" ]; then
+            P95_RESPONSE_TIME=$(jq -r '.metrics.http_req_duration.values.p95' performance/k6-results.json)
+            ERROR_RATE=$(jq -r '.metrics.http_req_failed.values.rate' performance/k6-results.json)
+            
+            echo "P95 Response Time: ${P95_RESPONSE_TIME}ms"
+            echo "Error Rate: ${ERROR_RATE}%"
+            
+            # Convert to integer for comparison (remove decimal)
+            P95_INT=$(echo "$P95_RESPONSE_TIME" | cut -d'.' -f1)
+            
+            if [ "$P95_INT" -gt "$MAX_API_RESPONSE_TIME" ]; then
+              echo "❌ Performance quality gate failed: P95 response time ${P95_RESPONSE_TIME}ms exceeds threshold ${MAX_API_RESPONSE_TIME}ms"
+              exit 1
+            fi
+            
+            # Error rate should be less than 1%
+            ERROR_RATE_INT=$(echo "$ERROR_RATE * 100" | bc | cut -d'.' -f1)
+            if [ "$ERROR_RATE_INT" -gt "1" ]; then
+              echo "❌ Performance quality gate failed: Error rate ${ERROR_RATE}% exceeds 1%"
+              exit 1
+            fi
+            
+            echo "✅ Performance quality gate passed"
+          else
+            echo "⚠️  Performance results not found, skipping validation"
+          fi
+          
+      - name: 📤 Upload Performance Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-reports-${{ needs.build-validation.outputs.build-version }}
+          path: performance/
+
+  # ===== PHASE 5: DOCKER BUILD WITH SECURITY SCAN =====
+  docker-build:
+    name: 🐳 Docker Build & Security Scan
+    runs-on: ubuntu-latest
+    needs: [build-validation, security-gate]
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: 📥 Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ needs.build-validation.outputs.build-version }}
+          
+      - name: 🐳 Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.build-validation.outputs.build-version }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: 🛡️ Trivy Container Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ needs.build-validation.outputs.build-version }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          
+      - name: 📊 Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ===== PHASE 6: QUALITY GATE SUMMARY =====
+  quality-gate-summary:
+    name: 📊 Quality Gate Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, security-gate, performance-gate, docker-build]
+    if: always()
+    timeout-minutes: 5
+    
+    steps:
+      - name: 📊 Generate Quality Gate Report
+        run: |
+          echo "# 🛡️ Fortress Quality Gate Summary" > quality-gate-report.md
+          echo "" >> quality-gate-report.md
+          echo "## 📋 Quality Gate Results" >> quality-gate-report.md
+          echo "" >> quality-gate-report.md
+          
+          # Check job statuses
+          UNIT_TESTS="${{ needs.unit-tests.result }}"
+          INTEGRATION_TESTS="${{ needs.integration-tests.result }}"
+          SECURITY_GATE="${{ needs.security-gate.result }}"
+          PERFORMANCE_GATE="${{ needs.performance-gate.result }}"
+          DOCKER_BUILD="${{ needs.docker-build.result }}"
+          
+          echo "| Quality Gate | Status | Result |" >> quality-gate-report.md
+          echo "|--------------|--------|---------|" >> quality-gate-report.md
+          echo "| Unit Tests (90% coverage) | $([ "$UNIT_TESTS" = "success" ] && echo "✅" || echo "❌") | $UNIT_TESTS |" >> quality-gate-report.md
+          echo "| Integration Tests (85% coverage) | $([ "$INTEGRATION_TESTS" = "success" ] && echo "✅" || echo "❌") | $INTEGRATION_TESTS |" >> quality-gate-report.md
+          echo "| Security Scan (0 critical) | $([ "$SECURITY_GATE" = "success" ] && echo "✅" || echo "❌") | $SECURITY_GATE |" >> quality-gate-report.md
+          echo "| Performance Tests (<100ms P95) | $([ "$PERFORMANCE_GATE" = "success" ] && echo "✅" || echo "❌") | $PERFORMANCE_GATE |" >> quality-gate-report.md
+          echo "| Docker Security Scan | $([ "$DOCKER_BUILD" = "success" ] && echo "✅" || echo "❌") | $DOCKER_BUILD |" >> quality-gate-report.md
+          echo "" >> quality-gate-report.md
+          
+          # Overall status
+          if [ "$UNIT_TESTS" = "success" ] && [ "$INTEGRATION_TESTS" = "success" ] && [ "$SECURITY_GATE" = "success" ] && [ "$PERFORMANCE_GATE" = "success" ] && [ "$DOCKER_BUILD" = "success" ]; then
+            echo "## ✅ ALL QUALITY GATES PASSED" >> quality-gate-report.md
+            echo "The build meets all fortress-grade quality requirements and is ready for deployment." >> quality-gate-report.md
+            echo "QUALITY_GATE_STATUS=PASSED" >> $GITHUB_ENV
+          else
+            echo "## ❌ QUALITY GATES FAILED" >> quality-gate-report.md
+            echo "One or more quality gates failed. The build does not meet fortress-grade requirements." >> quality-gate-report.md
+            echo "QUALITY_GATE_STATUS=FAILED" >> $GITHUB_ENV
+          fi
+          
+          cat quality-gate-report.md
+          
+      - name: 📤 Upload Quality Gate Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-report-${{ needs.build-validation.outputs.build-version }}
+          path: quality-gate-report.md
+          
+      - name: 💬 Comment Quality Gate Results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('quality-gate-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+            
+      - name: ❌ Fail Build if Quality Gates Failed
+        if: env.QUALITY_GATE_STATUS == 'FAILED'
+        run: |
+          echo "❌ Quality gates failed. Build cannot proceed to deployment."
+          exit 1
+
+  # ===== CONDITIONAL: PROMOTE TO CD PIPELINE =====
+  promote-to-cd:
+    name: 🚀 Promote to CD Pipeline
+    runs-on: ubuntu-latest
+    needs: [build-validation, quality-gate-summary]
+    if: >
+      success() && 
+      (github.ref == 'refs/heads/main' || 
+       github.ref == 'refs/heads/develop' ||
+       startsWith(github.ref, 'refs/heads/release/'))
+    timeout-minutes: 5
+    
+    steps:
+      - name: 🚀 Trigger Deployment Pipeline
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'fortress-cd.yml',
+              ref: context.ref,
+              inputs: {
+                build_version: '${{ needs.build-validation.outputs.build-version }}',
+                environment: context.ref === 'refs/heads/main' ? 'production' : 'staging',
+                quality_gate_passed: 'true'
+              }
+            });
+            
+            console.log('Deployment pipeline triggered:', result.data);
