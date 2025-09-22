@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"context"
 	"time"
 
 	"github.com/pat-fortress/pkg/fortress/legacy"
@@ -54,10 +53,23 @@ type StorageConfig struct {
 
 // NewStorageBackend creates a new storage backend based on configuration
 func NewStorageBackend(config *StorageConfig) (StorageBackend, error) {
-	// For email testing, just use the existing memory store with a close method
-	return &SimpleStorageWrapper{
-		store: legacy.NewInMemoryFortressStore(),
-	}, nil
+	if config == nil {
+		config = &StorageConfig{
+			Type:           "memory",
+			EnableFullText: true,
+		}
+	}
+
+	switch config.Type {
+	case "memory", "":
+		// Use enhanced indexed store for better search performance
+		return NewIndexedFortressStore(config), nil
+	default:
+		// Fallback to simple wrapper for other storage types
+		return &SimpleStorageWrapper{
+			store: legacy.NewInMemoryFortressStore(),
+		}, nil
+	}
 }
 
 // SimpleStorageWrapper wraps legacy store with close method

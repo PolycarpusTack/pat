@@ -131,6 +131,9 @@ secrets/
 # Cache
 .cache/
 .parcel-cache/
+.gocache/
+.gomod/
+.gotmp/
 
 # Python (for scripts)
 __pycache__/

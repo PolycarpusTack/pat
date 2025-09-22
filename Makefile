@@ -37,9 +37,9 @@ MUTATION_THRESHOLD := 85
 
 # Directories
 TEST_DIR := ./tests
-UNIT_TEST_DIR := $(TEST_DIR)/unit
-INTEGRATION_TEST_DIR := ./test/integration
-BENCHMARK_TEST_DIR := $(TEST_DIR)/benchmarks
+UNIT_TEST_DIR := ./...
+INTEGRATION_TEST_DIR := ./tests/integration
+BENCHMARK_TEST_DIR := ./...
 COVERAGE_DIR := ./coverage
 REPORTS_DIR := ./reports
 
@@ -69,13 +69,13 @@ fortress-deps: ## Download and verify dependencies
 fortress-test-unit: fortress-deps ## Run fortress unit tests
 	@echo "⚔️ Running fortress unit tests..."
 	@$(GO) test $(RACE_DETECTOR) -coverprofile=$(COVERAGE_OUT) -covermode=atomic \
-		-timeout=$(TEST_TIMEOUT) $(UNIT_TEST_DIR)/...
+		-timeout=$(TEST_TIMEOUT) $(UNIT_TEST_DIR)
 	@echo "✅ Unit tests complete"
 
 fortress-test-benchmark: fortress-deps ## Run fortress performance benchmarks
 	@echo "🏃 Running fortress performance benchmarks..."
-	@$(GO) test -bench=BenchmarkFortress -benchmem -benchtime=$(BENCHMARK_TIME) \
-		$(BENCHMARK_TEST_DIR)/... | tee $(REPORTS_DIR)/fortress-benchmark-results.txt
+	@$(GO) test -bench=. -benchmem -benchtime=$(BENCHMARK_TIME) \
+		$(BENCHMARK_TEST_DIR) | tee $(REPORTS_DIR)/fortress-benchmark-results.txt
 	@echo "✅ Performance benchmarks complete"
 
 fortress-test: fortress-test-unit fortress-test-benchmark ## Run all fortress tests

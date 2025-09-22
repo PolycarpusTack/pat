@@ -1,16 +1,14 @@
 package legacy
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
-	"io"
-	"log"
-	"mime"
-	"net/mail"
-	"strings"
-	"time"
+    "crypto/rand"
+    "encoding/base64"
+    "io"
+    "log"
+    "net/mail"
+    "sync"
+    "strings"
+    "time"
 )
 
 // FortressCompatibilityLayer provides a modern replacement for legacy MailHog components
@@ -248,8 +246,9 @@ type FortressMessageStore interface {
 
 // InMemoryFortressStore implements a fortress-compatible in-memory message store
 type InMemoryFortressStore struct {
-	messages map[MessageID]*Message
-	ordered  []MessageID
+    messages map[MessageID]*Message
+    ordered  []MessageID
+    mu       sync.RWMutex
 }
 
 // NewInMemoryFortressStore creates a new fortress-compatible in-memory store
@@ -262,27 +261,33 @@ func NewInMemoryFortressStore() *InMemoryFortressStore {
 
 // Store saves a message in the fortress store
 func (s *InMemoryFortressStore) Store(m *Message) (MessageID, error) {
-	if m.ID == "" {
-		id, err := NewMessageID("fortress.local")
-		if err != nil {
-			return "", err
-		}
-		m.ID = id
-	}
-	
-	s.messages[m.ID] = m
-	s.ordered = append(s.ordered, m.ID)
-	return m.ID, nil
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if m.ID == "" {
+        id, err := NewMessageID("fortress.local")
+        if err != nil {
+            return "", err
+        }
+        m.ID = id
+    }
+    
+    s.messages[m.ID] = m
+    s.ordered = append(s.ordered, m.ID)
+    return m.ID, nil
 }
 
 // Count returns the total number of messages
 func (s *InMemoryFortressStore) Count() int {
-	return len(s.messages)
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    return len(s.messages)
 }
 
 // List returns messages with pagination
 func (s *InMemoryFortressStore) List(start, limit int) (*Messages, error) {
-	messages := make(Messages, 0)
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    messages := make(Messages, 0)
 
 	// Clamp start to valid bounds to prevent index out of range panic
 	if start < 0 {
@@ -297,28 +302,32 @@ func (s *InMemoryFortressStore) List(start, limit int) (*Messages, error) {
 		end = len(s.ordered)
 	}
 
-	for i := start; i < end; i++ {
-		if msg, exists := s.messages[s.ordered[i]]; exists {
-			messages = append(messages, *msg)
-		}
-	}
+    for i := start; i < end; i++ {
+        if msg, exists := s.messages[s.ordered[i]]; exists {
+            messages = append(messages, *msg)
+        }
+    }
 
 	return &messages, nil
 }
 
 // Load retrieves a message by ID
 func (s *InMemoryFortressStore) Load(id MessageID) (*Message, error) {
-	if msg, exists := s.messages[id]; exists {
-		return msg, nil
-	}
-	return nil, ErrMessageNotFound
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    if msg, exists := s.messages[id]; exists {
+        return msg, nil
+    }
+    return nil, ErrMessageNotFound
 }
 
 // Search searches messages (basic implementation for compatibility)
 func (s *InMemoryFortressStore) Search(kind, query string, start, limit int) (*Messages, error) {
-	// Basic search implementation - can be enhanced with more sophisticated search
-	messages := make(Messages, 0)
-	found := 0
+    // Basic search implementation - can be enhanced with more sophisticated search
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    messages := make(Messages, 0)
+    found := 0
 	
 	for _, id := range s.ordered {
 		msg, exists := s.messages[id]
@@ -359,28 +368,32 @@ func (s *InMemoryFortressStore) Search(kind, query string, start, limit int) (*M
 
 // DeleteOne removes a single message
 func (s *InMemoryFortressStore) DeleteOne(id MessageID) error {
-	if _, exists := s.messages[id]; !exists {
-		return ErrMessageNotFound
-	}
-	
-	delete(s.messages, id)
-	
-	// Remove from ordered list
-	for i, orderedID := range s.ordered {
-		if orderedID == id {
-			s.ordered = append(s.ordered[:i], s.ordered[i+1:]...)
-			break
-		}
-	}
-	
-	return nil
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if _, exists := s.messages[id]; !exists {
+        return ErrMessageNotFound
+    }
+    
+    delete(s.messages, id)
+    
+    // Remove from ordered list
+    for i, orderedID := range s.ordered {
+        if orderedID == id {
+            s.ordered = append(s.ordered[:i], s.ordered[i+1:]...)
+            break
+        }
+    }
+    
+    return nil
 }
 
 // DeleteAll removes all messages
 func (s *InMemoryFortressStore) DeleteAll() error {
-	s.messages = make(map[MessageID]*Message)
-	s.ordered = make([]MessageID, 0)
-	return nil
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.messages = make(map[MessageID]*Message)
+    s.ordered = make([]MessageID, 0)
+    return nil
 }
 
 // Common errors for fortress compatibility

@@ -41,11 +41,11 @@ type FortressConfig struct {
 
 // DefaultConfig returns default fortress configuration
 func DefaultConfig() *FortressConfig {
-	return &FortressConfig{
-		AuthFile:         "",
-		WebPath:          "",
-		SMTPBindAddr:     "0.0.0.0:1025",
-		HTTPBindAddr:     "0.0.0.0:8025",
+    return &FortressConfig{
+        AuthFile:         "",
+        WebPath:          "web",
+        SMTPBindAddr:     "0.0.0.0:1025",
+        HTTPBindAddr:     "0.0.0.0:8025",
 		Hostname:         "fortress.local",
 		MaxMessageSize:   10 * 1024 * 1024, // 10MB
 		StorageType:      "memory",
@@ -102,10 +102,8 @@ func Configure() *FortressConfig {
 		fortressCfg.EnableAIAnalysis = true
 	}
 
-	// Sanitize webpath - add leading slash
-	if fortressCfg.WebPath != "" && fortressCfg.WebPath[0] != '/' {
-		fortressCfg.WebPath = "/" + fortressCfg.WebPath
-	}
+    // WebPath is treated as a filesystem directory for static assets
+    // Do not modify it to avoid breaking relative paths like "web"
 
 	return fortressCfg
 }

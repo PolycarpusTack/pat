@@ -17,16 +17,17 @@ import (
 
 // FortressSMTPServer provides a modern SMTP server with legacy MailHog compatibility
 type FortressSMTPServer struct {
-	config       *FortressSMTPConfig
-	logger       *zap.Logger
-	store        legacy.FortressMessageStore
-	parser       *legacy.FortressMessageParser
-	listener     net.Listener
-	tlsConfig    *tls.Config
-	shutdown     chan struct{}
-	rateLimiter  *ratelimit.SimpleRateLimiter
-	connMutex    sync.RWMutex
-	activeConns  int
+    config       *FortressSMTPConfig
+    logger       *zap.Logger
+    store        legacy.FortressMessageStore
+    parser       *legacy.FortressMessageParser
+    listener     net.Listener
+    tlsConfig    *tls.Config
+    shutdown     chan struct{}
+    rateLimiter  *ratelimit.SimpleRateLimiter
+    connMutex    sync.RWMutex
+    activeConns  int
+    onMessage    func(*legacy.Message)
 }
 
 // FortressSMTPConfig defines configuration for the fortress SMTP server
@@ -493,13 +494,13 @@ func (s *FortressSMTPSession) handleData() bool {
 	message.Metadata["helo"] = s.helo
 	message.Metadata["tls"] = fmt.Sprintf("%v", s.tls)
 
-	// Store message
-	messageID, err := s.server.store.Store(message)
-	if err != nil {
-		s.logger.Error("Failed to store message", zap.Error(err))
-		s.writeLine("554 Transaction failed: storage error")
-		return true
-	}
+    // Store message
+    messageID, err := s.server.store.Store(message)
+    if err != nil {
+        s.logger.Error("Failed to store message", zap.Error(err))
+        s.writeLine("554 Transaction failed: storage error")
+        return true
+    }
 
 	s.logger.Info("Message received and stored",
 		zap.String("message_id", string(messageID)),
@@ -508,14 +509,25 @@ func (s *FortressSMTPSession) handleData() bool {
 		zap.Int("size", len(raw.Data)),
 	)
 
-	s.writeLine("250 OK: message queued as %s", messageID)
+    s.writeLine("250 OK: message queued as %s", messageID)
 
-	// Reset session for next message
-	s.from = ""
-	s.to = nil
-	s.state = StateHelo
+    // Reset session for next message
+    s.from = ""
+    s.to = nil
+    s.state = StateHelo
 
-	return true
+    // Notify listeners about new message
+    if s.server.onMessage != nil {
+        // best-effort notify; avoid blocking SMTP path
+        go s.server.onMessage(message)
+    }
+
+    return true
+}
+
+// SetOnMessageCallback registers a callback to be invoked when a message is stored
+func (s *FortressSMTPServer) SetOnMessageCallback(cb func(*legacy.Message)) {
+    s.onMessage = cb
 }
 
 // handleQuit processes QUIT command

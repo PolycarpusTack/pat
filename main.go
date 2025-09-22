@@ -12,6 +12,7 @@ import (
 
 	"github.com/pat-fortress/config"
 	"github.com/pat-fortress/pkg/fortress/legacy"
+	"github.com/pat-fortress/pkg/fortress/logging"
 	"github.com/pat-fortress/pkg/fortress/smtp"
 	"github.com/pat-fortress/pkg/fortress/storage"
 	fortresshttp "github.com/pat-fortress/pkg/fortress/http"
@@ -26,27 +27,70 @@ var (
 	cfg     *config.FortressConfig
 )
 
-// initLogger initializes the fortress logger
+// initLogger initializes the fortress logger with production-ready configuration
 func initLogger() error {
-	var config zap.Config
+	// Create logging configuration based on environment and flags
+	logConfig := &logging.LoggerConfig{
+		Level:           logging.LogLevel(cfg.LogLevel),
+		Format:          logging.FormatJSON,
+		OutputPath:      "stdout",
+		ErrorOutputPath: "stderr",
+		EnableCaller:    true,
+		EnableStacktrace: true,
+		SamplingEnabled: true,
+		SamplingRate:    100,
+		ServiceName:     "pat-fortress",
+		ServiceVersion:  version,
+		Environment:     getEnvironment(),
+		NodeID:         getNodeID(),
+	}
 
-	switch cfg.LogLevel {
-	case "debug":
-		config = zap.NewDevelopmentConfig()
-	case "info", "warn", "error":
-		config = zap.NewProductionConfig()
-		config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	default:
-		config = zap.NewProductionConfig()
+	// Override format for development
+	if cfg.LogLevel == "debug" {
+		logConfig.Format = logging.FormatConsole
+		logConfig.SamplingEnabled = false
 	}
 
 	var err error
-	logger, err = config.Build()
+	logger, err = logging.NewLogger(logConfig)
 	if err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
 	}
 
+	logger.Info("Logger initialized",
+		zap.String("level", string(logConfig.Level)),
+		zap.String("format", string(logConfig.Format)),
+		zap.String("environment", logConfig.Environment),
+		zap.String("service", logConfig.ServiceName),
+		zap.String("version", logConfig.ServiceVersion),
+	)
+
 	return nil
+}
+
+// getEnvironment determines the current environment
+func getEnvironment() string {
+	if env := os.Getenv("FORTRESS_ENV"); env != "" {
+		return env
+	}
+	if env := os.Getenv("ENVIRONMENT"); env != "" {
+		return env
+	}
+	if cfg.LogLevel == "debug" {
+		return "development"
+	}
+	return "production"
+}
+
+// getNodeID generates a unique node identifier
+func getNodeID() string {
+	if nodeID := os.Getenv("NODE_ID"); nodeID != "" {
+		return nodeID
+	}
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+	return "unknown"
 }
 
 // initStorage initializes the fortress message store
@@ -213,9 +257,22 @@ func main() {
 		OpenAIModel:      cfg.OpenAIModel,
 	}
 
-	// Create servers
-	smtpServer := smtp.NewFortressSMTPServer(smtpConfig, store, logger)
-	httpServer := fortresshttp.NewFortressHTTPServer(httpConfig, store, logger)
+    // Create servers
+    smtpServer := smtp.NewFortressSMTPServer(smtpConfig, store, logger)
+    httpServer := fortresshttp.NewFortressHTTPServer(httpConfig, store, logger)
+
+    // Wire SMTP -> WebSocket event notifications
+    smtpServer.SetOnMessageCallback(func(msg *legacy.Message) {
+        payload := map[string]interface{}{
+            "id":        string(msg.ID),
+            "from":      func() string { if msg.From != nil { return msg.From.Address }; return "" }(),
+            "to":        func() []string { var out []string; for _, a := range msg.To { out = append(out, a.Address) }; return out }(),
+            "created":   msg.Created,
+            "size":      msg.Content.Size,
+            "tenant_id": msg.TenantID,
+        }
+        httpServer.PublishEvent("message_received", payload)
+    })
 
 	// Start servers
 	go func() {
@@ -243,12 +300,8 @@ func main() {
 		logger.Info("Context cancelled")
 	}
 
-	// Graceful shutdown with timeout
+	// Graceful shutdown
 	logger.Info("Shutting down servers...")
-
-	// Give servers a reasonable time to shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
 
 	// Shutdown SMTP server
 	if err := smtpServer.Shutdown(); err != nil {
@@ -258,12 +311,10 @@ func main() {
 	}
 
 	// Shutdown HTTP server
-	if httpServer.server != nil {
-		if err := httpServer.server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("Error shutting down HTTP server", zap.Error(err))
-		} else {
-			logger.Info("HTTP server shut down successfully")
-		}
+	if err := httpServer.Shutdown(); err != nil {
+		logger.Error("Error shutting down HTTP server", zap.Error(err))
+	} else {
+		logger.Info("HTTP server shut down successfully")
 	}
 
 	// Close storage

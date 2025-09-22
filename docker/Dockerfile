@@ -1,51 +1,20 @@
-# Multi-stage Dockerfile for Pat
+# Minimal Dockerfile for Pat (Go-only)
 
-# Stage 1: Go Builder
-FROM golang:1.21-alpine AS go-builder
-
-RUN apk add --no-cache git make gcc musl-dev
-
-WORKDIR /build
+FROM golang:1.21-alpine AS builder
+WORKDIR /src
+RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o pat-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/pat-fortress ./
 
-# Stage 2: Node Builder
-FROM node:18-alpine AS node-builder
-
-WORKDIR /build
-COPY package*.json ./
-RUN npm ci --only=production
-
-COPY . .
-RUN npm run build
-
-# Stage 3: Runtime
 FROM alpine:3.18
-
-RUN apk add --no-cache ca-certificates tzdata
-
-# Create non-root user
-RUN addgroup -g 1000 pat && \
-    adduser -u 1000 -G pat -s /bin/sh -D pat
-
+RUN addgroup -g 1000 pat && adduser -D -u 1000 -G pat pat \
+    && apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-
-# Copy binaries and assets
-COPY --from=go-builder /build/pat-server /app/
-COPY --from=node-builder /build/dist /app/dist
-COPY --from=node-builder /build/node_modules /app/node_modules
-
-# Set ownership
-RUN chown -R pat:pat /app
-
+COPY --from=builder /out/pat-fortress /app/pat-fortress
+COPY web /app/web
 USER pat
-
 EXPOSE 1025 8025
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/pat-server", "health"]
-
-ENTRYPOINT ["/app/pat-server"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD ["/app/pat-fortress", "--version"]
+ENTRYPOINT ["/app/pat-fortress"]

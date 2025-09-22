@@ -1,131 +1,22 @@
 version: '3.8'
 
 services:
-  # Pat Server
   pat:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
     container_name: pat-server
     ports:
       - "1025:1025"  # SMTP
       - "8025:8025"  # HTTP/API
     environment:
-      - PAT_ENV=development
-      - PAT_SMTP_PORT=1025
-      - PAT_HTTP_PORT=8025
-      - PAT_STORAGE=postgres
-      - PAT_POSTGRES_URL=postgres://pat:pat@postgres:5432/pat_dev?sslmode=disable
-      - PAT_REDIS_URL=redis://redis:6379
+      - PAT_SMTP_BIND_ADDR=0.0.0.0:1025
+      - PAT_HTTP_BIND_ADDR=0.0.0.0:8025
       - PAT_LOG_LEVEL=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - pat-network
+      - PAT_UI_WEB_PATH=/app/web
     volumes:
       - pat-data:/app/data
     restart: unless-stopped
 
-  # PostgreSQL Database
-  postgres:
-    image: postgres:15-alpine
-    container_name: pat-postgres
-    environment:
-      - POSTGRES_USER=pat
-      - POSTGRES_PASSWORD=pat
-      - POSTGRES_DB=pat_dev
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
-    networks:
-      - pat-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pat"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Redis Cache
-  redis:
-    image: redis:7-alpine
-    container_name: pat-redis
-    command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - pat-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Elasticsearch (for full-text search)
-  elasticsearch:
-    image: elasticsearch:8.11.0
-    container_name: pat-elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-    networks:
-      - pat-network
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-  # Kibana (for Elasticsearch management)
-  kibana:
-    image: kibana:8.11.0
-    container_name: pat-kibana
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    ports:
-      - "5601:5601"
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-    networks:
-      - pat-network
-
-  # LocalStack (for AWS services in development)
-  localstack:
-    image: localstack/localstack:latest
-    container_name: pat-localstack
-    environment:
-      - SERVICES=s3,sqs,secretsmanager,kms
-      - DEBUG=1
-      - DATA_DIR=/tmp/localstack/data
-      - LAMBDA_EXECUTOR=docker
-      - DOCKER_HOST=unix:///var/run/docker.sock
-    ports:
-      - "4566:4566"
-    volumes:
-      - localstack-data:/tmp/localstack
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - pat-network
-
-networks:
-  pat-network:
-    driver: bridge
-
 volumes:
   pat-data:
-  postgres-data:
-  redis-data:
-  elasticsearch-data:
-  localstack-data:

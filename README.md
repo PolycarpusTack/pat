@@ -52,7 +52,7 @@ export PAT_OPENAI_MODEL=gpt-3.5-turbo
 ```bash
 ./pat-fortress \
   --smtp-bind-addr=0.0.0.0:1025 \
-  --api-bind-addr=0.0.0.0:8025 \
+  --http-bind-addr=0.0.0.0:8025 \
   --max-message-size=10485760 \
   --enable-auth=false \
   --log-level=info \
@@ -148,7 +148,7 @@ export PAT_OPENAI_API_KEY=sk-your-api-key-here
 ```javascript
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
   host: 'localhost',
   port: 1025,
   secure: false, // Pat doesn't require TLS
@@ -402,4 +402,4 @@ Pat Fortress modernizes the codebase while maintaining compatibility.
 
 ---
 
-**Pat Fortress: Email testing that just works.** 📧# pat
+**Pat Fortress: Email testing that just works.** 📧

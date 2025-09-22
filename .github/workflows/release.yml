@@ -1,0 +1,333 @@
+name: Release Pat Fortress
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 2.0.0)'
+        required: true
+        default: '2.0.0'
+
+env:
+  BINARY_NAME: pat-fortress
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: freebsd
+            goarch: amd64
+          - goos: openbsd
+            goarch: amd64
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Get version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+        GIT_COMMIT=${GITHUB_SHA::8}
+        LDFLAGS="-X main.version=${VERSION} -X main.buildTime=${BUILD_TIME} -X main.gitCommit=${GIT_COMMIT} -s -w"
+
+        BINARY_NAME="${BINARY_NAME}_${VERSION}_${GOOS}_${GOARCH}"
+        if [ "$GOOS" = "windows" ]; then
+          BINARY_NAME="${BINARY_NAME}.exe"
+        fi
+
+        echo "Building ${BINARY_NAME}..."
+        go build -ldflags="${LDFLAGS}" -o "${BINARY_NAME}" .
+
+        # Create archive
+        if [ "$GOOS" = "windows" ]; then
+          zip "${BINARY_NAME%.exe}.zip" "${BINARY_NAME}" README.md LICENSE.md
+        else
+          tar czf "${BINARY_NAME}.tar.gz" "${BINARY_NAME}" README.md LICENSE.md
+        fi
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: binaries
+        path: |
+          pat-fortress_*
+          *.tar.gz
+          *.zip
+
+  package:
+    name: Create Packages
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: binaries
+        path: build/
+
+    - name: Get version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Install packaging tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rpm
+
+    - name: Create packages
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        chmod +x scripts/package.sh
+        scripts/package.sh
+
+    - name: Generate checksums
+      run: |
+        cd build
+        sha256sum pat-fortress_* > checksums.txt
+        cd ../packages
+        find . -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" | xargs sha256sum > package-checksums.txt
+
+    - name: Upload package artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: packages
+        path: |
+          packages/
+          build/checksums.txt
+
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: binaries
+        path: build/
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      if: github.event_name != 'workflow_dispatch'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Get version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Build and push Docker image
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        # Create multi-arch Dockerfile
+        cat > Dockerfile.multi << 'EOF'
+        FROM --platform=$BUILDPLATFORM alpine:latest AS builder
+        ARG TARGETPLATFORM
+        ARG BUILDPLATFORM
+        ARG VERSION
+
+        RUN apk --no-cache add ca-certificates tzdata
+
+        COPY build/ /build/
+        RUN case "$TARGETPLATFORM" in \
+              "linux/amd64") ARCH="amd64" ;; \
+              "linux/arm64") ARCH="arm64" ;; \
+              *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+            esac && \
+            cp "/build/pat-fortress_${VERSION}_linux_${ARCH}" /usr/local/bin/pat-fortress && \
+            chmod +x /usr/local/bin/pat-fortress
+
+        FROM alpine:latest
+        RUN apk --no-cache add ca-certificates tzdata
+        COPY --from=builder /usr/local/bin/pat-fortress /usr/local/bin/pat-fortress
+
+        EXPOSE 1025 8025
+        HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+          CMD /usr/local/bin/pat-fortress --version || exit 1
+
+        CMD ["/usr/local/bin/pat-fortress"]
+        EOF
+
+        # Build for test
+        docker buildx build \
+          --platform linux/amd64 \
+          --build-arg VERSION=${VERSION} \
+          -f Dockerfile.multi \
+          -t pat-fortress:${VERSION} \
+          .
+
+        # If this is a real release, push to Docker Hub
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ ! -z "${{ secrets.DOCKER_USERNAME }}" ]; then
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION=${VERSION} \
+            -f Dockerfile.multi \
+            -t patfortress/pat-fortress:${VERSION} \
+            -t patfortress/pat-fortress:latest \
+            --push \
+            .
+        fi
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, package, docker]
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: binaries
+        path: build/
+
+    - name: Download package artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: packages
+        path: packages/
+
+    - name: Get version
+      id: version
+      run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Generate release notes
+      id: notes
+      run: |
+        cat > release-notes.md << EOF
+        # Pat Fortress v${{ steps.version.outputs.version }}
+
+        ## 🚀 Installation
+
+        ### Quick Install (Linux/macOS)
+        \`\`\`bash
+        curl -sSL https://raw.githubusercontent.com/pat-fortress/pat-fortress/main/scripts/install.sh | bash
+        \`\`\`
+
+        ### Windows (PowerShell)
+        \`\`\`powershell
+        iwr -useb https://raw.githubusercontent.com/pat-fortress/pat-fortress/main/scripts/install.ps1 | iex
+        \`\`\`
+
+        ### Package Managers
+        \`\`\`bash
+        # Homebrew (macOS)
+        brew install pat-fortress
+
+        # Debian/Ubuntu
+        wget https://github.com/pat-fortress/pat-fortress/releases/download/v${{ steps.version.outputs.version }}/pat-fortress_${{ steps.version.outputs.version }}_amd64.deb
+        sudo dpkg -i pat-fortress_${{ steps.version.outputs.version }}_amd64.deb
+
+        # Docker
+        docker run -p 1025:1025 -p 8025:8025 patfortress/pat-fortress:${{ steps.version.outputs.version }}
+        \`\`\`
+
+        ## 📧 Quick Start
+
+        1. Start Pat Fortress: \`pat-fortress\`
+        2. Configure your app to send emails to \`localhost:1025\`
+        3. View emails at \`http://localhost:8025\`
+
+        ## 🔍 What's New
+
+        See [CHANGELOG.md](https://github.com/pat-fortress/pat-fortress/blob/main/CHANGELOG.md) for detailed changes.
+
+        ## 📋 Available Downloads
+
+        Choose the binary for your platform:
+        EOF
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        name: Pat Fortress v${{ steps.version.outputs.version }}
+        body_path: release-notes.md
+        draft: false
+        prerelease: false
+        files: |
+          build/pat-fortress_*
+          build/*.tar.gz
+          build/*.zip
+          build/checksums.txt
+          packages/*.deb
+          packages/*.rpm
+          packages/*.pkg
+          packages/package-checksums.txt
+          packages/homebrew/pat-fortress.rb
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: release
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+    - name: Update Homebrew formula
+      uses: peter-evans/repository-dispatch@v2
+      with:
+        token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        repository: pat-fortress/homebrew-tap
+        event-type: formula-update
+        client-payload: '{"version": "${{ needs.release.outputs.version }}", "url": "https://github.com/pat-fortress/pat-fortress/releases/download/v${{ needs.release.outputs.version }}/pat-fortress_${{ needs.release.outputs.version }}_darwin_amd64"}'
